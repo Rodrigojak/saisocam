@@ -9,7 +9,6 @@ struct CVector {
 #define ADDR_PLAYER_PED         0xB6F5F0
 #define ADDR_MENU_ACTIVE        0xBA67A4
 #define ADDR_WIDESCREEN_ON      0xB6F065
-#define ADDR_THE_CAMERA         0xB6F028
 
 typedef void(__thiscall* RestoreWithJumpCut_t)(void* pCamera);
 typedef void(__cdecl* AddMessageJumpQ_t)(const char* text, unsigned int time, unsigned short flag, bool bPreviousBrief);
@@ -17,22 +16,7 @@ typedef void(__cdecl* AddMessageJumpQ_t)(const char* text, unsigned int time, un
 RestoreWithJumpCut_t CamRestoreWithJumpCut = (RestoreWithJumpCut_t)0x50BAB0;
 AddMessageJumpQ_t ShowScreenMessage = (AddMessageJumpQ_t)0x69F1E0;
 
-// Já começa ativado por defeito (true)
-bool g_ModEnabled = true;
-int g_ZoomLevel = 1;
-int g_CurrentSide = 0;
-const float g_ZoomDistances[3] = { 9.5f, 14.0f, 20.5f };
-const float g_SideMultipliers[4][2] = {
-    { -1.0f, -1.0f },
-    {  1.0f, -1.0f },
-    {  1.0f,  1.0f },
-    { -1.0f,  1.0f }
-};
-
-float g_SmoothZoom = 14.0f;
-float g_SmoothX = -1.0f;
-float g_SmoothY = -1.0f;
-CVector g_SmoothFocus = { 0.0f, 0.0f, 0.0f };
+int g_CamMode = 0; // 0 = Normal do Jogo, 1 = Isométrica
 DWORD g_LastKeyTime = 0;
 
 bool GetEntityPosition(uintptr_t entityPtr, CVector& outPos) {
@@ -50,11 +34,23 @@ bool GetEntityPosition(uintptr_t entityPtr, CVector& outPos) {
     return true;
 }
 
-void ApplyIsometricCamera(const CVector& camPos, const CVector& lookAt) {
-    uint8_t activeCamIndex = *(uint8_t*)(ADDR_THE_CAMERA + 0x59);
-    uintptr_t activeCam = ADDR_THE_CAMERA + 0x174 + (activeCamIndex * 0x238);
+void ApplyIsometricCamera(uintptr_t camStruct, const CVector& targetPos) {
+    if (!camStruct) return;
+    uint8_t activeCamIndex = *(uint8_t*)(camStruct + 0x59);
+    uintptr_t activeCam = camStruct + 0x174 + (activeCamIndex * 0x238);
 
-    CVector front = { lookAt.x - camPos.x, lookAt.y - camPos.y, lookAt.z - camPos.z };
+    // Posição fixa isométrica limpa e estável
+    CVector camPos = {
+        targetPos.x - 12.0f,
+        targetPos.y - 12.0f,
+        targetPos.z + 14.0f
+    };
+
+    CVector front = {
+        targetPos.x - camPos.x,
+        targetPos.y - camPos.y,
+        targetPos.z - camPos.z
+    };
     float len = std::sqrt(front.x * front.x + front.y * front.y + front.z * front.z);
     if (len > 0.0001f) { front.x /= len; front.y /= len; front.z /= len; }
 
@@ -82,6 +78,12 @@ typedef void(__thiscall* CameraProcess_t)(void* pCamera);
 CameraProcess_t OriginalCameraProcess = nullptr;
 
 void __fastcall HookedCameraProcess(void* pCamera, void* edx) {
+    // Validação estrita para evitar crash por ponteiro nulo (0x00000000)
+    if (!pCamera) {
+        if (OriginalCameraProcess) OriginalCameraProcess(pCamera);
+        return;
+    }
+
     if (OriginalCameraProcess) {
         OriginalCameraProcess(pCamera);
     }
@@ -90,79 +92,42 @@ void __fastcall HookedCameraProcess(void* pCamera, void* edx) {
     bool cutsceneActive = *(bool*)ADDR_WIDESCREEN_ON;
     uintptr_t playerPed = *(uintptr_t*)ADDR_PLAYER_PED;
 
-    if (!playerPed || menuActive) return;
-
-    if (cutsceneActive) {
-        CamRestoreWithJumpCut((void*)ADDR_THE_CAMERA);
-        return;
-    }
+    if (!playerPed || menuActive || cutsceneActive) return;
 
     DWORD now = GetTickCount();
 
-    // Tecla V - Alternar Zoom
-    if ((GetAsyncKeyState(0x56) & 0x8000) && (now - g_LastKeyTime > 250)) {
+    // Tecla V alterna o modo de câmara de forma fluida
+    if ((GetAsyncKeyState(0x56) & 0x8000) && (now - g_LastKeyTime > 300)) {
         g_LastKeyTime = now;
-        g_ZoomLevel = (g_ZoomLevel + 1) % 3;
-        if (g_ZoomLevel == 0) ShowScreenMessage("Zoom: ~y~PROXIMA", 1000, 0, false);
-        if (g_ZoomLevel == 1) ShowScreenMessage("Zoom: ~g~MEDIA", 1000, 0, false);
-        if (g_ZoomLevel == 2) ShowScreenMessage("Zoom: ~b~DISTANTE", 1000, 0, false);
+        g_CamMode = (g_CamMode + 1) % 2; // Alterna entre 0 (Normal) e 1 (Isométrica)
+
+        if (g_CamMode == 0) {
+            CamRestoreWithJumpCut(pCamera);
+            if (ShowScreenMessage) ShowScreenMessage("Camera: ~g~Padrao", 1500, 0, false);
+        } else {
+            if (ShowScreenMessage) ShowScreenMessage("Camera: ~y~Isometrica", 1500, 0, false);
+        }
     }
 
-    // Tecla Z - Rodar Horário
-    if ((GetAsyncKeyState(0x5A) & 0x8000) && (now - g_LastKeyTime > 250)) {
-        g_LastKeyTime = now;
-        g_CurrentSide = (g_CurrentSide + 1) % 4;
+    // Aplica a câmara isométrica apenas se o modo estiver ativo
+    if (g_CamMode == 1) {
+        CVector targetPos;
+        if (GetEntityPosition(playerPed, targetPos)) {
+            ApplyIsometricCamera((uintptr_t)pCamera, targetPos);
+        }
     }
-
-    // Tecla X - Rodar Anti-Horário
-    if ((GetAsyncKeyState(0x58) & 0x8000) && (now - g_LastKeyTime > 250)) {
-        g_LastKeyTime = now;
-        g_CurrentSide = (g_CurrentSide + 3) % 4;
-    }
-
-    CVector targetPos;
-    if (!GetEntityPosition(playerPed, targetPos)) return;
-
-    float targetZoom = g_ZoomDistances[g_ZoomLevel];
-
-    uintptr_t vehiclePtr = *(uintptr_t*)(playerPed + 0x58C);
-    uint32_t pedFlags = *(uint32_t*)(playerPed + 0x46C);
-    if ((pedFlags & 0x100) && vehiclePtr) {
-        GetEntityPosition(vehiclePtr, targetPos);
-        CVector moveSpeed = *(CVector*)(vehiclePtr + 0x44);
-        float speed = std::sqrt(moveSpeed.x * moveSpeed.x + moveSpeed.y * moveSpeed.y) * 50.0f;
-        targetZoom += 4.0f + (speed * 0.45f);
-        if (targetZoom > 42.0f) targetZoom = 42.0f;
-    }
-
-    g_SmoothZoom += (targetZoom - g_SmoothZoom) * 0.08f;
-    g_SmoothX += (g_SideMultipliers[g_CurrentSide][0] - g_SmoothX) * 0.12f;
-    g_SmoothY += (g_SideMultipliers[g_CurrentSide][1] - g_SmoothY) * 0.12f;
-
-    g_SmoothFocus.x += (targetPos.x - g_SmoothFocus.x) * 0.15f;
-    g_SmoothFocus.y += (targetPos.y - g_SmoothFocus.y) * 0.15f;
-    g_SmoothFocus.z += (targetPos.z - g_SmoothFocus.z) * 0.15f;
-
-    CVector camPos = {
-        g_SmoothFocus.x + (g_SmoothZoom * g_SmoothX),
-        g_SmoothFocus.y + (g_SmoothZoom * g_SmoothY),
-        g_SmoothFocus.z + (g_SmoothZoom * 1.25f)
-    };
-
-    ApplyIsometricCamera(camPos, g_SmoothFocus);
 }
 
 void InstallHook() {
-    uintptr_t targetFunc = 0x50EA40;
+    uintptr_t targetFunc = 0x50EA40; // Endereço seguro de CCamera::Process no GTA SA 1.0 US
     DWORD oldProtect;
-    VirtualProtect((void*)targetFunc, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-    
-    OriginalCameraProcess = (CameraProcess_t)targetFunc;
-    uintptr_t relAddr = (uintptr_t)HookedCameraProcess - (targetFunc + 5);
-    *(uint8_t*)targetFunc = 0xE9;
-    *(uintptr_t*)(targetFunc + 1) = relAddr;
-    
-    VirtualProtect((void*)targetFunc, 5, oldProtect, &oldProtect);
+    if (VirtualProtect((void*)targetFunc, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        OriginalCameraProcess = (CameraProcess_t)targetFunc;
+        uintptr_t relAddr = (uintptr_t)HookedCameraProcess - (targetFunc + 5);
+        *(uint8_t*)targetFunc = 0xE9;
+        *(uintptr_t*)(targetFunc + 1) = relAddr;
+        VirtualProtect((void*)targetFunc, 5, oldProtect, &oldProtect);
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
