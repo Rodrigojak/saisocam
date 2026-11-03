@@ -77,12 +77,13 @@ void ApplyIsometricCamera(const CVector& camPos, const CVector& lookAt) {
     *(CVector*)(activeCam + 0x154) = up;
 }
 
-// Substituímos o hook de Idle por um gancho direto na função de processamento da câmara (CCam::Process / 0x50EA40)
 typedef void(__thiscall* CameraProcess_t)(void* pCamera);
 CameraProcess_t OriginalCameraProcess = nullptr;
 
 void __fastcall HookedCameraProcess(void* pCamera, void* edx) {
-    OriginalCameraProcess(pCamera);
+    if (OriginalCameraProcess) {
+        OriginalCameraProcess(pCamera);
+    }
 
     bool menuActive = *(bool*)ADDR_MENU_ACTIVE;
     bool cutsceneActive = *(bool*)ADDR_WIDESCREEN_ON;
@@ -148,4 +149,36 @@ void __fastcall HookedCameraProcess(void* pCamera, void* edx) {
     g_SmoothX += (g_SideMultipliers[g_CurrentSide][0] - g_SmoothX) * 0.12f;
     g_SmoothY += (g_SideMultipliers[g_CurrentSide][1] - g_SmoothY) * 0.12f;
 
-    g_SmoothFocus.
+    g_SmoothFocus.x += (targetPos.x - g_SmoothFocus.x) * 0.15f;
+    g_SmoothFocus.y += (targetPos.y - g_SmoothFocus.y) * 0.15f;
+    g_SmoothFocus.z += (targetPos.z - g_SmoothFocus.z) * 0.15f;
+
+    CVector camPos = {
+        g_SmoothFocus.x + (g_SmoothZoom * g_SmoothX),
+        g_SmoothFocus.y + (g_SmoothZoom * g_SmoothY),
+        g_SmoothFocus.z + (g_SmoothZoom * 1.25f)
+    };
+
+    ApplyIsometricCamera(camPos, g_SmoothFocus);
+}
+
+void InstallHook() {
+    uintptr_t targetFunc = 0x50EA40;
+    DWORD oldProtect;
+    VirtualProtect((void*)targetFunc, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    
+    OriginalCameraProcess = (CameraProcess_t)targetFunc;
+    uintptr_t relAddr = (uintptr_t)HookedCameraProcess - (targetFunc + 5);
+    *(uint8_t*)targetFunc = 0xE9;
+    *(uintptr_t*)(targetFunc + 1) = relAddr;
+    
+    VirtualProtect((void*)targetFunc, 5, oldProtect, &oldProtect);
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        InstallHook();
+    }
+    return TRUE;
+}
