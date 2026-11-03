@@ -17,7 +17,8 @@ typedef void(__cdecl* AddMessageJumpQ_t)(const char* text, unsigned int time, un
 RestoreWithJumpCut_t CamRestoreWithJumpCut = (RestoreWithJumpCut_t)0x50BAB0;
 AddMessageJumpQ_t ShowScreenMessage = (AddMessageJumpQ_t)0x69F1E0;
 
-bool g_ModEnabled = false;
+// Já começa ativado por defeito (true)
+bool g_ModEnabled = true;
 int g_ZoomLevel = 1;
 int g_CurrentSide = 0;
 const float g_ZoomDistances[3] = { 9.5f, 14.0f, 20.5f };
@@ -91,27 +92,14 @@ void __fastcall HookedCameraProcess(void* pCamera, void* edx) {
 
     if (!playerPed || menuActive) return;
 
-    DWORD now = GetTickCount();
-
-    if ((GetAsyncKeyState(0x49) & 0x8000) && (now - g_LastKeyTime > 250)) {
-        g_LastKeyTime = now;
-        g_ModEnabled = !g_ModEnabled;
-        if (g_ModEnabled) {
-            GetEntityPosition(playerPed, g_SmoothFocus);
-            ShowScreenMessage("Camera Isometrica: ~g~ATIVADA", 1500, 0, false);
-        } else {
-            CamRestoreWithJumpCut((void*)ADDR_THE_CAMERA);
-            ShowScreenMessage("Camera Isometrica: ~r~DESATIVADA", 1500, 0, false);
-        }
-    }
-
-    if (!g_ModEnabled) return;
-
     if (cutsceneActive) {
         CamRestoreWithJumpCut((void*)ADDR_THE_CAMERA);
         return;
     }
 
+    DWORD now = GetTickCount();
+
+    // Tecla V - Alternar Zoom
     if ((GetAsyncKeyState(0x56) & 0x8000) && (now - g_LastKeyTime > 250)) {
         g_LastKeyTime = now;
         g_ZoomLevel = (g_ZoomLevel + 1) % 3;
@@ -120,11 +108,13 @@ void __fastcall HookedCameraProcess(void* pCamera, void* edx) {
         if (g_ZoomLevel == 2) ShowScreenMessage("Zoom: ~b~DISTANTE", 1000, 0, false);
     }
 
+    // Tecla Z - Rodar Horário
     if ((GetAsyncKeyState(0x5A) & 0x8000) && (now - g_LastKeyTime > 250)) {
         g_LastKeyTime = now;
         g_CurrentSide = (g_CurrentSide + 1) % 4;
     }
 
+    // Tecla X - Rodar Anti-Horário
     if ((GetAsyncKeyState(0x58) & 0x8000) && (now - g_LastKeyTime > 250)) {
         g_LastKeyTime = now;
         g_CurrentSide = (g_CurrentSide + 3) % 4;
