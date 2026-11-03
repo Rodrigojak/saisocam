@@ -8,8 +8,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - name: Inicializar Ferramentas de Compilação MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
 
       - name: Compilar IsoCam.asi
         shell: cmd
