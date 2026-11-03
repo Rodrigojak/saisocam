@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <cmath>
+#include <cstdint>
 
 // Estrutura de vetor 3D do GTA SA
 struct CVector {
