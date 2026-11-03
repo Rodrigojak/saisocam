@@ -8,13 +8,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configurar Compilador C++ 32-bit
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x86
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
 
       - name: Compilar IsoCam.asi
-        run: cl /EHsc /LD /O2 main.cpp user32.lib /link /OUT:IsoCam.asi
+        shell: cmd
+        run: |
+          cl /EHsc /LD /O2 main.cpp user32.lib /link /OUT:IsoCam.asi
 
       - name: Disponibilizar IsoCam.asi para Download
         uses: actions/upload-artifact@v4
