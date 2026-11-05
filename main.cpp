@@ -88,7 +88,9 @@ namespace IsometricCamMod {
 
         void UpdateRW() {
             typedef void(__thiscall* fnUpdateRW)(CMatrix*);
-            reinterpret_cast<fnUpdateRW>(0x59BBB0)(this);
+            if (this && 0x59BBB0) {
+                reinterpret_cast<fnUpdateRW>(0x59BBB0)(this);
+            }
         }
     };
 
@@ -99,8 +101,11 @@ namespace IsometricCamMod {
         CMatrix* m_matrix;
 
         CVector GetPosition() const {
-            if (m_matrix) return m_matrix->pos;
-            return m_placementPos;
+            if (this) {
+                if (m_matrix) return m_matrix->pos;
+                return m_placementPos;
+            }
+            return CVector(0, 0, 0);
         }
     };
 
@@ -157,25 +162,43 @@ namespace IsometricCamMod {
             reinterpret_cast<fnCalcDerived>(0x514D60)(reinterpret_cast<void*>(TheCameraAddr()), bForMirror, bOriented);
         }
 
-        static inline float GetTimeStep() { return *reinterpret_cast<float*>(0xB7CB5C); }
-        static inline bool IsUserPaused() { return *reinterpret_cast<bool*>(0xB7CB49); }
-        static inline bool IsCodePaused() { return *reinterpret_cast<bool*>(0xB7CB48); }
-        static inline bool IsCutsceneRunning() { return *reinterpret_cast<bool*>(0xB5F851); }
-        static inline bool IsMenuActive() { return *reinterpret_cast<bool*>(0xBA6748 + 0x32); }
+        static inline float GetTimeStep() { 
+            float* pTimeStep = reinterpret_cast<float*>(0xB7CB5C);
+            return pTimeStep ? *pTimeStep : 1.0f;
+        }
+        static inline bool IsUserPaused() { 
+            bool* pPaused = reinterpret_cast<bool*>(0xB7CB49);
+            return pPaused ? *pPaused : false;
+        }
+        static inline bool IsCodePaused() { 
+            bool* pPaused = reinterpret_cast<bool*>(0xB7CB48);
+            return pPaused ? *pPaused : false;
+        }
+        static inline bool IsCutsceneRunning() { 
+            bool* pCut = reinterpret_cast<bool*>(0xB5F851);
+            return pCut ? *pCut : false;
+        }
+        static inline bool IsMenuActive() { 
+            bool* pMenu = reinterpret_cast<bool*>(0xBA6748 + 0x32);
+            return pMenu ? *pMenu : false;
+        }
 
         static inline CPlaceable* FindPlayerPed(int playerId = 0) {
             typedef CPlaceable*(__cdecl* fnFindPlayerPed)(int);
-            return reinterpret_cast<fnFindPlayerPed>(0x56E210)(playerId);
+            auto fn = reinterpret_cast<fnFindPlayerPed>(0x56E210);
+            return fn ? fn(playerId) : nullptr;
         }
 
         static inline CPlaceable* FindPlayerVehicle(int playerId = 0, bool bIncludeRemote = false) {
             typedef CPlaceable*(__cdecl* fnFindPlayerVehicle)(int, bool);
-            return reinterpret_cast<fnFindPlayerVehicle>(0x56E0D0)(playerId, bIncludeRemote);
+            auto fn = reinterpret_cast<fnFindPlayerVehicle>(0x56E0D0);
+            return fn ? fn(playerId, bIncludeRemote) : nullptr;
         }
 
         static inline void AddHudMessage(const char* text, uint32_t timeMs = 1800) {
             typedef void(__cdecl* fnAddMessageJumpQ)(const char*, uint32_t, uint16_t, bool);
-            reinterpret_cast<fnAddMessageJumpQ>(0x69F1E0)(text, timeMs, 0, false);
+            auto fn = reinterpret_cast<fnAddMessageJumpQ>(0x69F1E0);
+            if (fn) fn(text, timeMs, 0, false);
         }
     }
 
@@ -218,7 +241,7 @@ namespace IsometricCamMod {
             std::string logFilePath = std::string(modPath) + "\\IsometricCameraSA.log";
             g_LogFile = fopen(logFilePath.c_str(), "w");
             if (g_LogFile) {
-                fprintf(g_LogFile, "[INFO] IsometricCameraSA inicializado com sucesso.\n");
+                fprintf(g_LogFile, "[INFO] IsometricCameraSA inicializado com blindagem anti-crash.\n");
                 fflush(g_LogFile);
             }
         }
@@ -227,15 +250,6 @@ namespace IsometricCamMod {
                 fclose(g_LogFile);
                 g_LogFile = nullptr;
             }
-        }
-        static void Info(const char* fmt, ...) {
-            if (!g_LogFile) return;
-            va_list args;
-            va_start(args, fmt);
-            vfprintf(g_LogFile, fmt, args);
-            fprintf(g_LogFile, "\n");
-            fflush(g_LogFile);
-            va_end(args);
         }
     };
 
@@ -271,11 +285,9 @@ namespace IsometricCamMod {
 
             if (g_Config.bIsometricEnabled) {
                 GameSA::AddHudMessage("~g~Camera Isometrica Ativada (~y~Tecla Z~g~)", 2000);
-                Logger::Info("Camera isometrica ativada pelo usuario.");
             } else {
                 GameSA::RestoreCameraWithJumpCut();
                 GameSA::AddHudMessage("~w~Camera Padrao Restaurada", 1500);
-                Logger::Info("Camera padrao restaurada.");
             }
         }
         bPrevKeyState = bCurrKeyState;
@@ -286,21 +298,26 @@ namespace IsometricCamMod {
         if (!g_Config.bIsometricEnabled) return;
 
         CPlaceable* pPlayer = GameSA::FindPlayerPed(0);
-        if (!pPlayer) return;
+        if (!pPlayer) return; // Proteção contra ponteiro nulo ao carregar jogo
 
         CPlaceable* pVehicle = GameSA::FindPlayerVehicle(0, false);
         float dtSeconds = ClampVal(GameSA::GetTimeStep() / 50.0f, 0.001f, 0.1f);
         bool bInVehicle = (pVehicle != nullptr);
 
         CPlaceable* pFocusEntity = bInVehicle ? pVehicle : pPlayer;
+        if (!pFocusEntity) return;
+
         CVector targetPos = pFocusEntity->GetPosition();
         targetPos.z += bInVehicle ? 0.85f : 0.65f;
 
         float targetYawRad = 45.0f * DEG2RAD + (static_cast<int>(g_Config.eCurrentQuadrant) * 90.0f * DEG2RAD);
         float targetPitchRad = ISO_DEFAULT_PITCH_DEG * DEG2RAD;
 
+        CPlaceable* pCamPlaceable = GameSA::GetCameraPlaceable();
+        if (!pCamPlaceable) return;
+
         if (!g_bCamInitialized) {
-            g_CurrentCamPos = GameSA::GetCameraPlaceable()->GetPosition();
+            g_CurrentCamPos = pCamPlaceable->GetPosition();
             g_CurrentLookAt = targetPos;
             g_CurrentYawRad = targetYawRad;
             g_CurrentPitchRad = targetPitchRad;
@@ -341,8 +358,7 @@ namespace IsometricCamMod {
         activeCam.m_vecTargetCoorsForFudgeInter = g_CurrentLookAt;
         activeCam.m_fFOV = g_Config.fFOV;
 
-        CPlaceable* pCamPlaceable = GameSA::GetCameraPlaceable();
-        if (pCamPlaceable && pCamPlaceable->m_matrix) {
+        if (pCamPlaceable->m_matrix) {
             pCamPlaceable->m_matrix->right = vecRight;
             pCamPlaceable->m_matrix->up = vecForward;
             pCamPlaceable->m_matrix->at = vecUp;
@@ -355,9 +371,8 @@ namespace IsometricCamMod {
     }
 
     static DWORD WINAPI CameraUpdateLoop(LPVOID /*lpParam*/) {
-        Sleep(2500);
+        Sleep(3000); // Aguarda o carregamento completo do mundo
         Logger::Init(g_hThisModule);
-        Logger::Info("Loop de atualizacao de camera estavel iniciado.");
 
         while (true) {
             if (!GameSA::IsUserPaused() && !GameSA::IsCodePaused() && !GameSA::IsCutsceneRunning()) {
