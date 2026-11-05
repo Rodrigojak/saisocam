@@ -1,913 +1,1204 @@
-/*
-    ========================================================================
-     IsoCam.cpp  -  Camera Isometrica para GTA San Andreas 1.0 US
-    ========================================================================
+/**
+ * ============================================================================
+ * gemini Mod: Isometric Camera Mod for GTA San Andreas (v1.0 US Hoodlum / Compact)
+ * File: main.cpp / IsometricCameraSA.cpp
+ * Target: .asi (Dynamic Link Library - x86 32-bit)
+ * Build Command (GitHub Actions / MSVC x86):
+ *   cl /EHsc /LD /O2 main.cpp user32.lib /link /OUT:IsoCam.asi
+ * ============================================================================
+ *
+ * VERSÃO STANDALONE (ZERO DEPENDÊNCIAS EXTERNAS):
+ * Não requer download externo do plugin-sdk ("plugin.h"). Todos os endereços de
+ * memória, estruturas (CVector, CMatrix, CCam, CCamera, CMenuManager, CPad,
+ * CColPoint) e ponteiros de função nativos do GTA San Andreas 1.0 US estão
+ * mapeados diretamente neste arquivo para compilar direto no GitHub Actions.
+ * ============================================================================
+ */
 
-    O que este mod faz:
-      - Adiciona um modo de camera ISOMETRICA ao ciclo do botao nativo
-        "Mudar Camera" do jogo (a pe e dentro de veiculo).
-      - Camera fixa sobre o player, com 4 lados (N/E/S/W) trocaveis por
-        combinacao de teclas, com transicao suave (interpolada).
-      - No veiculo, duas opcoes configuraveis pelo menu de pausa:
-          * Flexivel: mantem a mesma altura/angulo, mas gira acompanhando
-                      a traseira do carro (como uma camera de perseguicao).
-          * Fixa:     mantem a mesma direcao isometrica do mundo que o
-                      player tinha a pe, independente da direcao do carro.
-      - Ajuste de distancia de visao da camera isometrica pelo menu.
-      - Adaptacao automatica em interiores (reduz distancia para evitar
-        atravessar paredes).
-      - Protecao para nao brigar com cutscenes/camera de script.
-      - Sistema de log completo (arquivo IsoCam.log) para depuracao.
-      - Deteccao de outros plugins .asi carregados junto no processo.
-
-    Base tecnica:
-      Este mod foi escrito para ser compilado com o plugin-sdk
-      (https://github.com/DK22Pac/plugin-sdk), que ja resolve os
-      enderecos de memoria da versao 1.0 US para as classes do jogo
-      (CCamera, CPad, CGame, CMenuManager, etc). Alguns valores que o
-      plugin-sdk nao expõe por nome (os bytes de "modo de camera atual",
-      a pe e em veiculo) sao acessados por endereco direto, confirmados
-      a partir de engenharia reversa publica da comunidade (MTA:SA /
-      CCameraSA.h) para a build 1.0 US:
-          VAR_PedCameraView     = 0x00B6F0F0  (BYTE)
-          VAR_VehicleCameraView = 0x00B6F0DC  (BYTE)
-
-    IMPORTANTE - LEIA O README.md:
-      Alguns nomes/valores abaixo (contagem de modos nativos de camera,
-      ID da pagina "Controles" do menu, o parametro de modo da funcao
-      TakeControlNoEntity, o sinal usado para calcular o heading do
-      veiculo) dependem de pequenas variacoes entre copias do plugin-sdk
-      e devem ser CALIBRADOS testando no jogo com o log ativado. Isso e
-      normal em engenharia reversa de jogos antigos: nenhum mod deste
-      tipo funciona 100% "de primeira" sem um teste in-game. O log foi
-      construido exatamente para te ajudar nesse ajuste fino.
-
-    ========================================================================
-*/
-
-#include "plugin.h"
-
-#include <game_sa/common.h>
-#include <game_sa/CCamera.h>
-#include <game_sa/CPad.h>
-#include <game_sa/CGame.h>
-#include <game_sa/CTimer.h>
-#include <game_sa/CPed.h>
-#include <game_sa/CVehicle.h>
-#include <game_sa/CEntity.h>
-#include <game_sa/CVector.h>
-#include <game_sa/CMenuManager.h>
-#include <game_sa/CCutsceneMgr.h>
-
-// NOTA DE COMPILACAO: CRect, CRGBA e o global "FrontEndMenuManager" (usados
-// na SECAO 7) normalmente ja vêm junto de <game_sa/CMenuManager.h> acima.
-// Se o compilador reclamar de "CRect"/"CRGBA" nao declarados, adicione aqui
-// o include correspondente da sua copia do plugin-sdk (em algumas versoes
-// fica em "shared/CRGBA.h" e "shared/CRect.h", em outras em "game_sa/").
-// Se "FrontEndMenuManager" nao for encontrado, procure pelo nome exato do
-// ponteiro/referencia global de CMenuManager no seu CMenuManager.h local
-// (ex.: pode ser "*FrontEndMenuManager", um ponteiro, em vez de referencia -
-// nesse caso troque os "." por "->" nas chamadas da SECAO 7).
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <windows.h>
-#include <tlhelp32.h>
-
+#include <psapi.h>
+#include <shlwapi.h>
 #include <cstdio>
 #include <cstdarg>
-#include <cstring>
-#include <cstdlib>
-#include <cctype>
 #include <cmath>
+#include <ctime>
+#include <cstdint>
+#include <vector>
 #include <string>
-#include <fstream>
-#include <iomanip>
 #include <algorithm>
-#include <map>
 
-using namespace plugin;
+// Linkagem automática das bibliotecas do Windows SDK no MSVC (cl.exe)
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "shlwapi.lib")
 
-// ========================================================================
-//  SECAO 1 - CONSTANTES, ENDERECOS CONFIRMADOS E PEQUENOS UTILITARIOS
-// ========================================================================
+namespace IsometricCamMod {
 
-namespace IsoAddr
-{
-    // Bytes de "modo de camera atual" usados pelo jogo (1.0 US).
-    // O jogo incrementa esses bytes sozinho sempre que o player aperta o
-    // botao nativo de mudar camera (seja qual for a tecla/botao que ele
-    // tiver configurado). Nos apenas OBSERVAMOS a mudanca de valor para
-    // saber que o botao foi pressionado; nunca escrevemos nesses bytes,
-    // para nao arriscar corromper o estado interno do jogo.
-    static volatile BYTE* const PedCameraMode     = reinterpret_cast<volatile BYTE*>(0x00B6F0F0);
-    static volatile BYTE* const VehicleCameraMode = reinterpret_cast<volatile BYTE*>(0x00B6F0DC);
-}
+    // ========================================================================
+    // 1. UTILITÁRIOS MATEMÁTICOS E ESTRUTURAS NATIVAS DO GTA SA 1.0 US
+    // ========================================================================
+    static const float PI = 3.14159265358979323846f;
+    static const float DEG2RAD = PI / 180.0f;
 
-// Pagina do menu de pausa correspondente a aba "Controles" (CONFIGURATION /
-// Redefine Controls) no PC. Confirmado no enum eMenuScreen do plugin-sdk
-// (MENUPAGE_CONTROLLER_PC = 36). As paginas seguintes (37-40) sao as
-// sub-telas de redefinicao de controles; tratamos todas como "estamos na
-// secao de controles" para decidir quando desenhar nosso painel.
-static const int MENUPAGE_CONTROLLER_PC_ID      = 36;
-static const int MENUPAGE_REDEFINE_CONTROLS_ID  = 37;
-static const int MENUPAGE_KEYBOARD_CONTROLS_ID  = 38;
-static const int MENUPAGE_MOUSE_SETTINGS_ID     = 39;
-static const int MENUPAGE_JOYPAD_SETTINGS_ID    = 40;
-
-static inline bool IsOnControlsPage(int currScreen)
-{
-    return currScreen == MENUPAGE_CONTROLLER_PC_ID     ||
-           currScreen == MENUPAGE_REDEFINE_CONTROLS_ID ||
-           currScreen == MENUPAGE_KEYBOARD_CONTROLS_ID ||
-           currScreen == MENUPAGE_MOUSE_SETTINGS_ID    ||
-           currScreen == MENUPAGE_JOYPAD_SETTINGS_ID;
-}
-
-static const float PI_F = 3.14159265358979323846f;
-static inline float DegToRad(float d) { return d * (PI_F / 180.0f); }
-static inline float RadToDeg(float r) { return r * (180.0f / PI_F); }
-
-static inline float Lerp(float a, float b, float t)
-{
-    return a + (b - a) * t;
-}
-
-// Interpola angulos (graus) sempre pelo caminho mais curto, evitando que
-// o giro de 350 graus para 10 graus passe "a volta toda" em vez de +20.
-static inline float LerpAngleDeg(float current, float target, float t)
-{
-    float diff = std::fmod(target - current + 540.0f, 360.0f) - 180.0f;
-    return current + diff * t;
-}
-
-static inline float ClampF(float v, float lo, float hi)
-{
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
-
-// ========================================================================
-//  SECAO 2 - LOG COMPLETO (arquivo IsoCam.log na pasta do mod)
-// ========================================================================
-
-enum class LogLevel { LDEBUG, LINFO, LWARN, LERROR };
-
-class Logger
-{
-public:
-    void Init(const std::string& path, bool verbose)
-    {
-        m_verbose = verbose;
-        m_file.open(path, std::ios::out | std::ios::app);
-        Info("========================================================");
-        Info("IsoCam iniciado. Log aberto em: %s", path.c_str());
+    template <typename T>
+    static inline T ClampVal(T val, T minVal, T maxVal) {
+        if (val < minVal) return minVal;
+        if (val > maxVal) return maxVal;
+        return val;
     }
 
-    void SetVerbose(bool verbose) { m_verbose = verbose; }
+    struct CVector {
+        float x, y, z;
 
-    void Debug(const char* fmt, ...) { if (m_verbose) { va_list a; va_start(a, fmt); Write(LogLevel::LDEBUG, fmt, a); va_end(a); } }
-    void Info (const char* fmt, ...) { va_list a; va_start(a, fmt); Write(LogLevel::LINFO,  fmt, a); va_end(a); }
-    void Warn (const char* fmt, ...) { va_list a; va_start(a, fmt); Write(LogLevel::LWARN,  fmt, a); va_end(a); }
-    void Error(const char* fmt, ...) { va_list a; va_start(a, fmt); Write(LogLevel::LERROR, fmt, a); va_end(a); }
+        CVector() : x(0.0f), y(0.0f), z(0.0f) {}
+        CVector(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 
-private:
-    void Write(LogLevel lvl, const char* fmt, va_list args)
-    {
-        if (!m_file.is_open())
+        CVector operator+(const CVector& rhs) const { return CVector(x + rhs.x, y + rhs.y, z + rhs.z); }
+        CVector operator-(const CVector& rhs) const { return CVector(x - rhs.x, y - rhs.y, z - rhs.z); }
+        CVector operator*(float s) const { return CVector(x * s, y * s, z * s); }
+
+        float Magnitude() const { return std::sqrt(x * x + y * y + z * z); }
+
+        void Normalise() {
+            float mag = Magnitude();
+            if (mag > 0.0001f) {
+                x /= mag;
+                y /= mag;
+                z /= mag;
+            }
+        }
+    };
+
+    static inline CVector CrossProduct(const CVector& a, const CVector& b) {
+        return CVector(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x
+        );
+    }
+
+    struct CRGBA {
+        uint8_t r, g, b, a;
+        CRGBA(uint8_t _r, uint8_t _g, uint8_t _b, uint8_t _a = 255) : r(_r), g(_g), b(_b), a(_a) {}
+    };
+
+    #pragma pack(push, 1)
+    struct CMatrix {
+        CVector right;      // 0x00 (Eixo X)
+        uint32_t flags;     // 0x0C
+        CVector up;         // 0x10 (Eixo Y - Vetor Forward no GTA SA)
+        uint32_t pad1;      // 0x1C
+        CVector at;         // 0x20 (Eixo Z - Vetor Up no GTA SA)
+        uint32_t pad2;      // 0x2C
+        CVector pos;        // 0x30 (Posição no mundo)
+        uint32_t pad3;      // 0x3C
+        void* m_pAttachMatrix;
+        uint8_t m_bOwnsAttachedMatrix;
+        uint8_t pad4[3];
+
+        void UpdateRW() {
+            typedef void(__thiscall* fnUpdateRW)(CMatrix*);
+            reinterpret_cast<fnUpdateRW>(0x59BBB0)(this);
+        }
+    };
+
+    struct CPlaceable {
+        void* vtable;           // 0x00
+        CVector m_placementPos; // 0x04
+        float m_fHeading;       // 0x10
+        CMatrix* m_matrix;      // 0x14
+
+        CVector GetPosition() const {
+            if (m_matrix) return m_matrix->pos;
+            return m_placementPos;
+        }
+    };
+
+    struct CColPoint {
+        CVector m_vecPoint;      // 0x00
+        float field_C;           // 0x0C
+        CVector m_vecNormal;     // 0x10
+        float field_1C;          // 0x1C
+        uint8_t m_nSurfaceTypeA; // 0x20
+        uint8_t m_nPieceTypeA;   // 0x21
+        uint8_t m_nLightingA;    // 0x22
+        uint8_t padA;            // 0x23
+        uint8_t m_nSurfaceTypeB; // 0x24
+        uint8_t m_nPieceTypeB;   // 0x25
+        uint8_t m_nLightingB;    // 0x26
+        uint8_t padB;            // 0x27
+        float m_fDepth;          // 0x28
+    };
+
+    // Estrutura CCam do GTA SA 1.0 US (Tamanho exato: 0x238 bytes)
+    struct CCam {
+        uint8_t pad0[0x0C];
+        uint16_t m_nMode;                        // 0x0C
+        uint8_t pad1[0xEC - 0x0E];
+        float m_fFOV;                            // 0xEC
+        uint8_t pad2[0x128 - 0xF0];
+        CVector m_vecFront;                      // 0x128
+        CVector m_vecSource;                     // 0x134
+        CVector m_vecSourceBeforeLookBehind;     // 0x140
+        CVector m_vecUp;                         // 0x14C
+        uint8_t pad3[0x164 - 0x158];
+        CVector m_vecTargetCoorsForFudgeInter;   // 0x164
+        uint8_t pad4[0x238 - 0x170];
+    };
+    #pragma pack(pop)
+
+    // Enum de Modos de Câmera Nativos do GTA SA
+    enum eCamMode : uint16_t {
+        MODE_NONE = 0,
+        MODE_TOPDOWN = 1,
+        MODE_GTACLASSIC = 2,
+        MODE_BEHINDCAR = 3,
+        MODE_FOLLOWPED = 4,
+        MODE_AIMING = 5,
+        MODE_SNIPER = 7,
+        MODE_ROCKETLAUNCHER = 8,
+        MODE_CAM_ON_A_STRING = 18,
+        MODE_CAMERA = 46,
+        MODE_ROCKETLAUNCHER_HS = 51,
+        MODE_AIMWEAPON = 53,
+        MODE_AIMWEAPON_FROMCAR = 55,
+        MODE_AIMWEAPON_ATTACHED = 65
+    };
+
+    // ========================================================================
+    // 2. ACESSORES DE MEMÓRIA E FUNÇÕES DO EXECUTÁVEL GTA_SA.EXE (1.0 US)
+    // ========================================================================
+    namespace GameSA {
+        // Ponteiro base de TheCamera (0xB6F028)
+        static inline uintptr_t TheCameraAddr() { return 0xB6F028; }
+
+        static inline CPlaceable* GetCameraPlaceable() {
+            return reinterpret_cast<CPlaceable*>(TheCameraAddr());
+        }
+
+        static inline uint8_t GetActiveCamIndex() {
+            return *reinterpret_cast<uint8_t*>(TheCameraAddr() + 0x59);
+        }
+
+        static inline CCam& GetActiveCam() {
+            CCam* cams = reinterpret_cast<CCam*>(TheCameraAddr() + 0x174);
+            uint8_t idx = GetActiveCamIndex();
+            if (idx > 2) idx = 0;
+            return cams[idx];
+        }
+
+        static inline bool IsWidescreenOn() {
+            return *reinterpret_cast<bool*>(TheCameraAddr() + 0x75);
+        }
+
+        static inline uint16_t GetPedZoomIndicator() {
+            // 0 = Perto, 1 = Médio, 2 = Longe
+            return *reinterpret_cast<uint16_t*>(TheCameraAddr() + 0xF0);
+        }
+
+        static inline uint16_t GetCarZoomIndicator() {
+            // 0..5 (5 = Cinematic Camera)
+            return *reinterpret_cast<uint16_t*>(TheCameraAddr() + 0xEE);
+        }
+
+        static inline void SetCameraOrientation(float rad) {
+            *reinterpret_cast<float*>(TheCameraAddr() + 0xCE0) = rad;
+        }
+
+        static inline void RestoreCameraWithJumpCut() {
+            typedef void(__thiscall* fnRestoreWithJumpCut)(void*);
+            reinterpret_cast<fnRestoreWithJumpCut>(0x50BAB0)(reinterpret_cast<void*>(TheCameraAddr()));
+        }
+
+        static inline void SetRwCamPosition() {
+            typedef void(__thiscall* fnSetRwCamPosition)(void*);
+            reinterpret_cast<fnSetRwCamPosition>(0x50AFA0)(reinterpret_cast<void*>(TheCameraAddr()));
+        }
+
+        static inline void CalculateDerivedValues(bool bForMirror, bool bOriented) {
+            typedef void(__thiscall* fnCalcDerived)(void*, bool, bool);
+            reinterpret_cast<fnCalcDerived>(0x514D60)(reinterpret_cast<void*>(TheCameraAddr()), bForMirror, bOriented);
+        }
+
+        // CTimer e Pausa
+        static inline float GetTimeStep() { return *reinterpret_cast<float*>(0xB7CB5C); }
+        static inline bool IsUserPaused() { return *reinterpret_cast<bool*>(0xB7CB49); }
+        static inline bool IsCodePaused() { return *reinterpret_cast<bool*>(0xB7CB48); }
+
+        // Cutscenes e Interiores
+        static inline bool IsCutsceneRunning() { return *reinterpret_cast<bool*>(0xB5F851); }
+        static inline int GetCurrentInteriorArea() { return *reinterpret_cast<int*>(0xB72914); }
+
+        // Menu de Pausa (FrontEndMenuManager = 0xBA6748)
+        static inline bool IsMenuActive() { return *reinterpret_cast<bool*>(0xBA6748 + 0x32); }
+        static inline uint8_t GetCurrentMenuPage() { return *reinterpret_cast<uint8_t*>(0xBA6748 + 0x15D); }
+        static inline int GetMenuMousePosY() { return *reinterpret_cast<int*>(0xBA6748 + 0x3C); }
+
+        // Resolução da Tela (RsGlobal = 0xC17040)
+        static inline int GetScreenWidth() { return *reinterpret_cast<int*>(0xC17044); }
+        static inline int GetScreenHeight() { return *reinterpret_cast<int*>(0xC17048); }
+
+        // Entidades: Player e Veículo
+        static inline CPlaceable* FindPlayerPed(int playerId = 0) {
+            typedef CPlaceable*(__cdecl* fnFindPlayerPed)(int);
+            return reinterpret_cast<fnFindPlayerPed>(0x56E210)(playerId);
+        }
+
+        static inline CPlaceable* FindPlayerVehicle(int playerId = 0, bool bIncludeRemote = false) {
+            typedef CPlaceable*(__cdecl* fnFindPlayerVehicle)(int, bool);
+            return reinterpret_cast<fnFindPlayerVehicle>(0x56E0D0)(playerId, bIncludeRemote);
+        }
+
+        static inline CVector GetEntityMoveSpeed(CPlaceable* pEntity) {
+            if (!pEntity) return CVector(0.0f, 0.0f, 0.0f);
+            return *reinterpret_cast<CVector*>(reinterpret_cast<uintptr_t>(pEntity) + 0x44);
+        }
+
+        static inline int GetEntityAreaCode(CPlaceable* pEntity) {
+            if (!pEntity) return 0;
+            return *reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(pEntity) + 0x2F);
+        }
+
+        // Controles (CPad = 0xB73458)
+        static inline void* GetPad(int padNumber = 0) {
+            typedef void*(__cdecl* fnGetPad)(int);
+            return reinterpret_cast<fnGetPad>(0x53FB70)(padNumber);
+        }
+
+        static inline bool CycleCameraModeDownJustDown() {
+            void* pad = GetPad(0);
+            if (!pad) return false;
+            typedef bool(__thiscall* fnCycleCam)(void*);
+            return reinterpret_cast<fnCycleCam>(0x5404E0)(pad);
+        }
+
+        static inline bool IsChangeViewButtonHeld() {
+            void* pad = GetPad(0);
+            if (!pad) return false;
+            int16_t changeViewState = *reinterpret_cast<int16_t*>(reinterpret_cast<uintptr_t>(pad) + 0x1A);
+            return changeViewState != 0;
+        }
+
+        static inline bool ArePlayerControlsDisabled() {
+            void* pad = GetPad(0);
+            if (!pad) return false;
+            uint16_t disableFlags = *reinterpret_cast<uint16_t*>(reinterpret_cast<uintptr_t>(pad) + 0x10E);
+            return disableFlags != 0;
+        }
+
+        // Colisão (CWorld::ProcessLineOfSight = 0x56A490)
+        static inline bool ProcessLineOfSight(
+            const CVector& origin, const CVector& target, CColPoint& outColPoint, void*& outEntity,
+            bool buildings, bool vehicles, bool peds, bool objects, bool dummies,
+            bool doSeeThrough, bool cameraIgnore, bool shootThrough)
+        {
+            typedef bool(__cdecl* fnProcessLOS)(
+                const CVector&, const CVector&, CColPoint&, void*&,
+                bool, bool, bool, bool, bool, bool, bool, bool);
+            return reinterpret_cast<fnProcessLOS>(0x56A490)(
+                origin, target, outColPoint, outEntity,
+                buildings, vehicles, peds, objects, dummies,
+                doSeeThrough, cameraIgnore, shootThrough);
+        }
+
+        // Mensagens de HUD (CMessages::AddMessageJumpQ = 0x69F1E0)
+        static inline void AddHudMessage(const char* text, uint32_t timeMs = 1800) {
+            typedef void(__cdecl* fnAddMessageJumpQ)(const char*, uint32_t, uint16_t, bool);
+            reinterpret_cast<fnAddMessageJumpQ>(0x69F1E0)(text, timeMs, 0, false);
+        }
+
+        // Funções de Fonte Nativa (CFont) para desenhar no Menu de Pausa
+        static inline void FontSetScale(float w, float h) {
+            typedef void(__cdecl* fn)(float, float);
+            reinterpret_cast<fn>(0x719380)(w, h);
+        }
+        static inline void FontSetColor(CRGBA color) {
+            typedef void(__cdecl* fn)(CRGBA);
+            reinterpret_cast<fn>(0x719430)(color);
+        }
+        static inline void FontSetOrientation(uint8_t align) {
+            // 0 = Center, 1 = Left, 2 = Right
+            typedef void(__cdecl* fn)(uint8_t);
+            reinterpret_cast<fn>(0x719610)(align);
+        }
+        static inline void FontSetFontStyle(uint8_t style) {
+            // 2 = FONT_MENU
+            typedef void(__cdecl* fn)(uint8_t);
+            reinterpret_cast<fn>(0x719490)(style);
+        }
+        static inline void FontSetProportional(bool on) {
+            typedef void(__cdecl* fn)(bool);
+            reinterpret_cast<fn>(0x7195B0)(on);
+        }
+        static inline void FontSetBackground(bool enable, bool includeWrap) {
+            typedef void(__cdecl* fn)(bool, bool);
+            reinterpret_cast<fn>(0x7195C0)(enable, includeWrap);
+        }
+        static inline void FontSetDropShadowPosition(int16_t pos) {
+            typedef void(__cdecl* fn)(int16_t);
+            reinterpret_cast<fn>(0x719570)(pos);
+        }
+        static inline void FontSetDropColor(CRGBA color) {
+            typedef void(__cdecl* fn)(CRGBA);
+            reinterpret_cast<fn>(0x719510)(color);
+        }
+        static inline void FontSetWrapx(float wrapX) {
+            typedef void(__cdecl* fn)(float);
+            reinterpret_cast<fn>(0x7194D0)(wrapX);
+        }
+        static inline void FontPrintString(float x, float y, const char* text) {
+            typedef void(__cdecl* fn)(float, float, const char*);
+            reinterpret_cast<fn>(0x71A700)(x, y, text);
+        }
+    }
+
+    // ========================================================================
+    // 3. CONSTANTES E ENUMS DE CONFIGURAÇÃO DO MOD
+    // ========================================================================
+    static const float ISO_DEFAULT_PITCH_DEG = 38.0f;
+    static const float ISO_INTERIOR_PITCH_DEG = 52.0f;
+    static const uint8_t MENUPAGE_CONTROLLER_PC_ID = 37;
+
+    enum class VehicleIsoMode : int {
+        FIXED_PERSPECTIVE = 0,    // Mantém o ângulo cardinal isométrico fixo (igual a pé)
+        FLEXIBLE_BEHIND_CAR = 1   // Mantém a altura/inclinação isométrica, mas gira atrás do veículo
+    };
+
+    enum class IsoQuadrant : int {
+        NORTH_EAST = 0, // 45°
+        NORTH_WEST = 1, // 135°
+        SOUTH_WEST = 2, // 225°
+        SOUTH_EAST = 3  // 315°
+    };
+
+    struct ModConfig {
+        bool bIsometricEnabled = false;
+        VehicleIsoMode eVehicleMode = VehicleIsoMode::FLEXIBLE_BEHIND_CAR;
+        IsoQuadrant eCurrentQuadrant = IsoQuadrant::NORTH_EAST;
+
+        float fViewDistance = 22.0f;
+        float fMinDistance = 10.0f;
+        float fMaxDistance = 45.0f;
+        float fInteriorDistanceScale = 0.48f;
+
+        float fPositionSmoothSpeed = 7.5f;
+        float fRotationSmoothSpeed = 6.0f;
+        float fCollisionPullInSpeed = 18.0f;
+        float fFOV = 55.0f;
+
+        int vKeyModifier = VK_MENU;     // ALT (ou segurar o botão V de câmera)
+        int vKeyRotateLeft = 'Q';       // Q ou Seta Esquerda
+        int vKeyRotateRight = 'E';      // E ou Seta Direita
+        int vKeyZoomIn = VK_OEM_PLUS;   // +
+        int vKeyZoomOut = VK_OEM_MINUS; // -
+    };
+
+    struct LoadedAsiInfo {
+        std::string fileName;
+        std::string fullPath;
+        uintptr_t baseAddress;
+        DWORD imageSize;
+        bool bPotentialCameraConflict;
+        std::string conflictReason;
+    };
+
+    static ModConfig g_Config;
+    static std::vector<LoadedAsiInfo> g_LoadedAsiPlugins;
+    static FILE* g_LogFile = nullptr;
+    static PVOID g_VehHandle = nullptr;
+    static HMODULE g_hThisModule = nullptr;
+
+    // Estado de interpolação da câmera
+    static CVector g_CurrentCamPos(0.0f, 0.0f, 0.0f);
+    static CVector g_CurrentLookAt(0.0f, 0.0f, 0.0f);
+    static float g_CurrentYawRad = 45.0f * DEG2RAD;
+    static float g_CurrentPitchRad = ISO_DEFAULT_PITCH_DEG * DEG2RAD;
+    static float g_CurrentDist = 22.0f;
+    static bool g_bCamInitialized = false;
+    static bool g_bWasInCutsceneOrScriptCam = false;
+    static bool g_bWasInInterior = false;
+    static int g_MenuSelectedCustomRow = -1;
+
+    // ========================================================================
+    // 4. SISTEMA DE LOG COMPLETO E DIAGNÓSTICO DE ERROS
+    // ========================================================================
+    class Logger {
+    public:
+        static void Init(HMODULE hModule) {
+            char modPath[MAX_PATH] = { 0 };
+            GetModuleFileNameA(hModule, modPath, MAX_PATH);
+            PathRemoveFileSpecA(modPath);
+
+            std::string logFilePath = std::string(modPath) + "\\IsometricCameraSA.log";
+            g_LogFile = fopen(logFilePath.c_str(), "w");
+
+            if (g_LogFile) {
+                Info("======================================================================");
+                Info(" IsometricCameraSA.asi - Inicializando Log de Diagnostico");
+                Info(" Data/Hora de Inicio: %s", GetTimestamp().c_str());
+                Info(" Diretorio Base: %s", modPath);
+                Info("======================================================================");
+            }
+        }
+
+        static void Shutdown() {
+            if (g_LogFile) {
+                Info("======================================================================");
+                Info(" Encerrando IsometricCameraSA.asi normalmente.");
+                Info("======================================================================");
+                fclose(g_LogFile);
+                g_LogFile = nullptr;
+            }
+        }
+
+        static void Info(const char* fmt, ...) {
+            va_list args;
+            va_start(args, fmt);
+            WriteLog("INFO", fmt, args);
+            va_end(args);
+        }
+
+        static void Warn(const char* fmt, ...) {
+            va_list args;
+            va_start(args, fmt);
+            WriteLog("WARN", fmt, args);
+            va_end(args);
+        }
+
+        static void Error(const char* fmt, ...) {
+            va_list args;
+            va_start(args, fmt);
+            WriteLog("ERROR", fmt, args);
+            va_end(args);
+        }
+
+    private:
+        static std::string GetTimestamp() {
+            time_t now = time(nullptr);
+            struct tm tstruct;
+            char buf[64];
+            localtime_s(&tstruct, &now);
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tstruct);
+            return std::string(buf);
+        }
+
+        static void WriteLog(const char* level, const char* fmt, va_list args) {
+            if (!g_LogFile) return;
+            fprintf(g_LogFile, "[%s] [%s] ", GetTimestamp().c_str(), level);
+            vfprintf(g_LogFile, fmt, args);
+            fprintf(g_LogFile, "\n");
+            fflush(g_LogFile);
+        }
+    };
+
+    static LONG CALLBACK VectoredCrashHandler(PEXCEPTION_POINTERS pExceptionInfo) {
+        if (!pExceptionInfo || !pExceptionInfo->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+
+        DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+            code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_STACK_OVERFLOW) {
+
+            uintptr_t faultAddr = reinterpret_cast<uintptr_t>(pExceptionInfo->ExceptionRecord->ExceptionAddress);
+            HMODULE hFaultMod = nullptr;
+            char modName[MAX_PATH] = "Desconhecido (gta_sa.exe ou memoria dinamica)";
+
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(faultAddr), &hFaultMod)) {
+                GetModuleFileNameA(hFaultMod, modName, MAX_PATH);
+            }
+
+            Logger::Error("CRITICAL EXCEPTION DETECTADA! Codigo: 0x%08X no endereco: 0x%08X", code, faultAddr);
+            Logger::Error("Modulo causador provavel: %s (Base: 0x%08X, Offset: +0x%08X)",
+                          PathFindFileNameA(modName),
+                          reinterpret_cast<uintptr_t>(hFaultMod),
+                          faultAddr - reinterpret_cast<uintptr_t>(hFaultMod));
+
+            if (pExceptionInfo->ContextRecord) {
+                Logger::Error("Registradores x86 -> EAX: 0x%08X | EBX: 0x%08X | ECX: 0x%08X | EDX: 0x%08X",
+                              pExceptionInfo->ContextRecord->Eax, pExceptionInfo->ContextRecord->Ebx,
+                              pExceptionInfo->ContextRecord->Ecx, pExceptionInfo->ContextRecord->Edx);
+                Logger::Error("Registradores x86 -> ESI: 0x%08X | EDI: 0x%08X | EBP: 0x%08X | ESP: 0x%08X | EIP: 0x%08X",
+                              pExceptionInfo->ContextRecord->Esi, pExceptionInfo->ContextRecord->Edi,
+                              pExceptionInfo->ContextRecord->Ebp, pExceptionInfo->ContextRecord->Esp,
+                              pExceptionInfo->ContextRecord->Eip);
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // ========================================================================
+    // 5. LEITURA E AUDITORIA DE OUTROS SCRIPTS .ASI RODANDO NO JOGO
+    // ========================================================================
+    class AsiScanner {
+    public:
+        static void ScanLoadedModules() {
+            g_LoadedAsiPlugins.clear();
+            Logger::Info("Iniciando varredura de modulos .ASI carregados no processo gta_sa.exe...");
+
+            HANDLE hProcess = GetCurrentProcess();
+            HMODULE hMods[1024];
+            DWORD cbNeeded = 0;
+
+            if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+                size_t numModules = cbNeeded / sizeof(HMODULE);
+                for (size_t i = 0; i < numModules; ++i) {
+                    char szModPath[MAX_PATH] = { 0 };
+                    if (GetModuleFileNameExA(hProcess, hMods[i], szModPath, sizeof(szModPath))) {
+                        const char* ext = PathFindExtensionA(szModPath);
+                        if (ext && (_stricmp(ext, ".asi") == 0 || _stricmp(ext, ".dll") == 0)) {
+                            const char* fileName = PathFindFileNameA(szModPath);
+                            if (_stricmp(ext, ".asi") == 0 || _stricmp(fileName, "vorbisFile.dll") == 0 ||
+                                _stricmp(fileName, "vorbisHooked.dll") == 0) {
+
+                                MODULEINFO modInfo = { 0 };
+                                GetModuleInformation(hProcess, hMods[i], &modInfo, sizeof(modInfo));
+
+                                LoadedAsiInfo info;
+                                info.fileName = fileName;
+                                info.fullPath = szModPath;
+                                info.baseAddress = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
+                                info.imageSize = modInfo.SizeOfImage;
+                                AnalyzeConflictRisk(info);
+
+                                g_LoadedAsiPlugins.push_back(info);
+                            }
+                        }
+                    }
+                }
+            }
+
+            ScanDirectoryForAsi("");
+            ScanDirectoryForAsi("scripts\\");
+            ScanDirectoryForAsi("plugins\\");
+            ScanDirectoryForAsi("modloader\\");
+
+            Logger::Info("Total de plugins .ASI ativos detectados em memoria: %zu", g_LoadedAsiPlugins.size());
+            for (size_t i = 0; i < g_LoadedAsiPlugins.size(); ++i) {
+                const LoadedAsiInfo& plugin = g_LoadedAsiPlugins[i];
+                if (plugin.bPotentialCameraConflict) {
+                    Logger::Warn(" -> [CONFLITO POTENCIAL] %s (Base: 0x%08X, Tam: %lu KB) - Motivo: %s",
+                                 plugin.fileName.c_str(), plugin.baseAddress, plugin.imageSize / 1024,
+                                 plugin.conflictReason.c_str());
+                } else {
+                    Logger::Info(" -> [OK] %s (Base: 0x%08X, Tam: %lu KB) - %s",
+                                 plugin.fileName.c_str(), plugin.baseAddress, plugin.imageSize / 1024,
+                                 plugin.fullPath.c_str());
+                }
+            }
+        }
+
+    private:
+        static void AnalyzeConflictRisk(LoadedAsiInfo& info) {
+            std::string lowerName = info.fileName;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+            info.bPotentialCameraConflict = false;
+            info.conflictReason = "Nenhum conflito conhecido";
+
+            if (lowerName.find("firstperson") != std::string::npos || lowerName.find("fps") != std::string::npos) {
+                info.bPotentialCameraConflict = true;
+                info.conflictReason = "Mod de First Person sobrescreve CCamera::Process e ciclo do botao V.";
+            } else if (lowerName.find("camhunt") != std::string::npos || lowerName.find("freecam") != std::string::npos) {
+                info.bPotentialCameraConflict = true;
+                info.conflictReason = "Mod de FreeCam / CamHunt manipula matrizes de TheCamera diretamente.";
+            } else if (lowerName.find("v_hud") != std::string::npos || lowerName.find("gtavhud") != std::string::npos) {
+                info.bPotentialCameraConflict = true;
+                info.conflictReason = "GTA V HUD altera o CMenuManager e pode substituir a tela de opcoes/controles.";
+            } else if (lowerName.find("cleo") != std::string::npos) {
+                info.bPotentialCameraConflict = false;
+                info.conflictReason = "Runtime CLEO detectado (scripts .cs podem acionar cameras SCM).";
+            }
+        }
+
+        static void ScanDirectoryForAsi(const char* subDir) {
+            char searchPattern[MAX_PATH];
+            snprintf(searchPattern, sizeof(searchPattern), "%s*.asi", subDir);
+
+            WIN32_FIND_DATAA fd;
+            HANDLE hFind = FindFirstFileA(searchPattern, &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        HMODULE hLoaded = GetModuleHandleA(fd.cFileName);
+                        bool bAlreadyListed = false;
+                        for (size_t i = 0; i < g_LoadedAsiPlugins.size(); ++i) {
+                            if (_stricmp(g_LoadedAsiPlugins[i].fileName.c_str(), fd.cFileName) == 0) {
+                                bAlreadyListed = true;
+                                break;
+                            }
+                        }
+                        if (!bAlreadyListed && hLoaded != nullptr) {
+                            LoadedAsiInfo info;
+                            info.fileName = fd.cFileName;
+                            info.fullPath = std::string(subDir) + fd.cFileName;
+                            info.baseAddress = reinterpret_cast<uintptr_t>(hLoaded);
+                            info.imageSize = fd.nFileSizeLow;
+                            AnalyzeConflictRisk(info);
+                            g_LoadedAsiPlugins.push_back(info);
+                        } else if (!bAlreadyListed && hLoaded == nullptr) {
+                            Logger::Warn("Arquivo .ASI encontrado no disco mas NAO carregado em memoria: %s%s", subDir, fd.cFileName);
+                        }
+                    }
+                } while (FindNextFileA(hFind, &fd));
+                FindClose(hFind);
+            }
+        }
+    };
+
+    // ========================================================================
+    // 6. PERSISTÊNCIA DE CONFIGURAÇÃO (.INI)
+    // ========================================================================
+    class ConfigManager {
+    public:
+        static std::string GetIniPath() {
+            char path[MAX_PATH] = { 0 };
+            GetModuleFileNameA(g_hThisModule, path, MAX_PATH);
+            PathRenameExtensionA(path, ".ini");
+            return std::string(path);
+        }
+
+        static void Load() {
+            std::string ini = GetIniPath();
+            g_Config.eVehicleMode = static_cast<VehicleIsoMode>(
+                GetPrivateProfileIntA("IsometricCamera", "VehicleCameraMode", 1, ini.c_str()));
+
+            char distBuf[32] = { 0 };
+            GetPrivateProfileStringA("IsometricCamera", "ViewDistance", "22.0", distBuf, sizeof(distBuf), ini.c_str());
+            g_Config.fViewDistance = ClampVal(static_cast<float>(atof(distBuf)), g_Config.fMinDistance, g_Config.fMaxDistance);
+
+            g_Config.eCurrentQuadrant = static_cast<IsoQuadrant>(
+                GetPrivateProfileIntA("IsometricCamera", "DefaultQuadrant", 0, ini.c_str()) % 4);
+
+            g_Config.vKeyModifier = GetPrivateProfileIntA("Controls", "KeyModifier", VK_MENU, ini.c_str());
+            g_Config.vKeyRotateLeft = GetPrivateProfileIntA("Controls", "KeyRotateLeft", 'Q', ini.c_str());
+            g_Config.vKeyRotateRight = GetPrivateProfileIntA("Controls", "KeyRotateRight", 'E', ini.c_str());
+
+            Logger::Info("Configuracao carregada (%s): ModoVeiculo=%d, Distancia=%.1fm, Quadrante=%d",
+                         PathFindFileNameA(ini.c_str()),
+                         static_cast<int>(g_Config.eVehicleMode),
+                         g_Config.fViewDistance,
+                         static_cast<int>(g_Config.eCurrentQuadrant));
+        }
+
+        static void Save() {
+            std::string ini = GetIniPath();
+            char buf[64];
+
+            snprintf(buf, sizeof(buf), "%d", static_cast<int>(g_Config.eVehicleMode));
+            WritePrivateProfileStringA("IsometricCamera", "VehicleCameraMode", buf, ini.c_str());
+
+            snprintf(buf, sizeof(buf), "%.2f", g_Config.fViewDistance);
+            WritePrivateProfileStringA("IsometricCamera", "ViewDistance", buf, ini.c_str());
+
+            snprintf(buf, sizeof(buf), "%d", static_cast<int>(g_Config.eCurrentQuadrant));
+            WritePrivateProfileStringA("IsometricCamera", "DefaultQuadrant", buf, ini.c_str());
+
+            snprintf(buf, sizeof(buf), "%d", g_Config.vKeyModifier);
+            WritePrivateProfileStringA("Controls", "KeyModifier", buf, ini.c_str());
+
+            snprintf(buf, sizeof(buf), "%d", g_Config.vKeyRotateLeft);
+            WritePrivateProfileStringA("Controls", "KeyRotateLeft", buf, ini.c_str());
+
+            snprintf(buf, sizeof(buf), "%d", g_Config.vKeyRotateRight);
+            WritePrivateProfileStringA("Controls", "KeyRotateRight", buf, ini.c_str());
+        }
+    };
+
+    // ========================================================================
+    // 7. MATEMÁTICA DE INTERPOLAÇÃO E VERIFICAÇÃO DE VERSÃO (1.0 US)
+    // ========================================================================
+    static bool VerifyGameVersion10US() {
+        // Verifica assinatura no cabeçalho/código do GTA SA 1.0 US (0x53E968 contém 'CALL CCamera::Process' = 0xE8)
+        uint8_t byteAtHook = *reinterpret_cast<uint8_t*>(0x53C09A);
+        if (byteAtHook == 0xE8) {
+            Logger::Info("Assinatura de memoria validada: GTA San Andreas v1.0 US detectado.");
+            return true;
+        }
+        Logger::Error("Assinatura em 0x53C09A invalida (0x%02X)! Certifique-se de usar o gta_sa.exe v1.0 US.", byteAtHook);
+        return false;
+    }
+
+    static float NormalizeAngleRad(float angle) {
+        while (angle > PI) angle -= 2.0f * PI;
+        while (angle < -PI) angle += 2.0f * PI;
+        return angle;
+    }
+
+    static float LerpAngleRad(float current, float target, float factor) {
+        float diff = NormalizeAngleRad(target - current);
+        return NormalizeAngleRad(current + diff * ClampVal(factor, 0.0f, 1.0f));
+    }
+
+    static CVector SmoothLerpVector(const CVector& current, const CVector& target, float speed, float dtSeconds) {
+        float alpha = 1.0f - std::exp(-speed * dtSeconds);
+        alpha = ClampVal(alpha, 0.0f, 1.0f);
+        return CVector(
+            current.x + (target.x - current.x) * alpha,
+            current.y + (target.y - current.y) * alpha,
+            current.z + (target.z - current.z) * alpha
+        );
+    }
+
+    static float GetQuadrantYawRadians(IsoQuadrant q) {
+        switch (q) {
+            case IsoQuadrant::NORTH_EAST: return 45.0f * DEG2RAD;
+            case IsoQuadrant::NORTH_WEST: return 135.0f * DEG2RAD;
+            case IsoQuadrant::SOUTH_WEST: return 225.0f * DEG2RAD;
+            case IsoQuadrant::SOUTH_EAST: return 315.0f * DEG2RAD;
+            default: return 45.0f * DEG2RAD;
+        }
+    }
+
+    static const char* GetQuadrantName(IsoQuadrant q) {
+        switch (q) {
+            case IsoQuadrant::NORTH_EAST: return "Nordeste (45 deg)";
+            case IsoQuadrant::NORTH_WEST: return "Noroeste (135 deg)";
+            case IsoQuadrant::SOUTH_WEST: return "Sudoeste (225 deg)";
+            case IsoQuadrant::SOUTH_EAST: return "Sudeste (315 deg)";
+            default: return "Nordeste";
+        }
+    }
+
+    // ========================================================================
+    // 8. DETECÇÃO DE CUTSCENES, SCRIPTS, MIRA E ADAPTAÇÃO A INTERIORES
+    // ========================================================================
+    static bool ShouldYieldToNativeCamera(CPlaceable* pPlayer) {
+        if (!pPlayer) return true;
+
+        if (GameSA::IsMenuActive() || GameSA::IsUserPaused() || GameSA::IsCodePaused()) {
+            return true;
+        }
+
+        if (GameSA::IsCutsceneRunning() || GameSA::IsWidescreenOn() || GameSA::ArePlayerControlsDisabled()) {
+            if (!g_bWasInCutsceneOrScriptCam) {
+                Logger::Info("Cutscene ou Widescreen de script detectado. Pausando camera isometrica temporariamente.");
+                g_bWasInCutsceneOrScriptCam = true;
+            }
+            return true;
+        }
+
+        uint16_t activeMode = GameSA::GetActiveCam().m_nMode;
+        if (activeMode == MODE_SNIPER || activeMode == MODE_ROCKETLAUNCHER ||
+            activeMode == MODE_ROCKETLAUNCHER_HS || activeMode == MODE_CAMERA ||
+            activeMode == MODE_AIMWEAPON || activeMode == MODE_AIMWEAPON_FROMCAR ||
+            activeMode == MODE_AIMWEAPON_ATTACHED) {
+            return true;
+        }
+
+        if (g_bWasInCutsceneOrScriptCam) {
+            Logger::Info("Cutscene/Script encerrado. Retomando camera isometrica com transicao suave.");
+            g_bWasInCutsceneOrScriptCam = false;
+            g_CurrentCamPos = GameSA::GetCameraPlaceable()->GetPosition();
+        }
+
+        return false;
+    }
+
+    static bool IsPlayerInInterior(CPlaceable* pPlayer) {
+        int currArea = GameSA::GetCurrentInteriorArea();
+        bool inInterior = (currArea != 0) || (GameSA::GetEntityAreaCode(pPlayer) != 0);
+        if (inInterior != g_bWasInInterior) {
+            Logger::Info("Mudanca de ambiente detectada: %s (AreaID=%d)",
+                         inInterior ? "Entrou em Interior" : "Saiu para Exterior", currArea);
+            g_bWasInInterior = inInterior;
+        }
+        return inInterior;
+    }
+
+    // ========================================================================
+    // 9. CONTROLE DO BOTÃO DE CÂMERA (V) E COMBINAÇÕES DE 4 LADOS
+    // ========================================================================
+    static void HandleCameraControlsAndCycling(CPlaceable* pPlayer, CPlaceable* pVehicle) {
+        if (GameSA::IsMenuActive()) return;
+
+        bool bInVehicle = (pVehicle != nullptr);
+
+        static bool bPrevRotLeft = false;
+        static bool bPrevRotRight = false;
+
+        bool bModKeyDown = (GetAsyncKeyState(g_Config.vKeyModifier) & 0x8000) != 0 || GameSA::IsChangeViewButtonHeld();
+        bool bRotLeftDown = bModKeyDown && (
+            (GetAsyncKeyState(g_Config.vKeyRotateLeft) & 0x8000) != 0 ||
+            (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0
+        );
+        bool bRotRightDown = bModKeyDown && (
+            (GetAsyncKeyState(g_Config.vKeyRotateRight) & 0x8000) != 0 ||
+            (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0
+        );
+
+        if (g_Config.bIsometricEnabled) {
+            if (bRotLeftDown && !bPrevRotLeft) {
+                int nextQ = (static_cast<int>(g_Config.eCurrentQuadrant) + 1) % 4;
+                g_Config.eCurrentQuadrant = static_cast<IsoQuadrant>(nextQ);
+                ConfigManager::Save();
+
+                char msg[96];
+                snprintf(msg, sizeof(msg), "~y~Perspectiva Isometrica:~w~ %s", GetQuadrantName(g_Config.eCurrentQuadrant));
+                GameSA::AddHudMessage(msg, 1500);
+                Logger::Info("Quadrante isometrico alterado para: %s", GetQuadrantName(g_Config.eCurrentQuadrant));
+            }
+            if (bRotRightDown && !bPrevRotRight) {
+                int prevQ = (static_cast<int>(g_Config.eCurrentQuadrant) + 3) % 4;
+                g_Config.eCurrentQuadrant = static_cast<IsoQuadrant>(prevQ);
+                ConfigManager::Save();
+
+                char msg[96];
+                snprintf(msg, sizeof(msg), "~y~Perspectiva Isometrica:~w~ %s", GetQuadrantName(g_Config.eCurrentQuadrant));
+                GameSA::AddHudMessage(msg, 1500);
+                Logger::Info("Quadrante isometrico alterado para: %s", GetQuadrantName(g_Config.eCurrentQuadrant));
+            }
+
+            if (bModKeyDown) {
+                float dt = GameSA::GetTimeStep() / 50.0f;
+                if (GetAsyncKeyState(g_Config.vKeyZoomIn) & 0x8000) {
+                    g_Config.fViewDistance = ClampVal(g_Config.fViewDistance - 12.0f * dt, g_Config.fMinDistance, g_Config.fMaxDistance);
+                } else if (GetAsyncKeyState(g_Config.vKeyZoomOut) & 0x8000) {
+                    g_Config.fViewDistance = ClampVal(g_Config.fViewDistance + 12.0f * dt, g_Config.fMinDistance, g_Config.fMaxDistance);
+                }
+            }
+        }
+        bPrevRotLeft = bRotLeftDown;
+        bPrevRotRight = bRotRightDown;
+
+        // Integração com o botão nativo de mudar câmera (V)
+        if (GameSA::CycleCameraModeDownJustDown()) {
+            if (g_Config.bIsometricEnabled) {
+                g_Config.bIsometricEnabled = false;
+                GameSA::RestoreCameraWithJumpCut();
+                GameSA::AddHudMessage("~w~Camera Padrao Restaurada", 1200);
+                Logger::Info("Botao de camera pressionado: Saindo do modo Isometrico.");
+            } else {
+                if (!bInVehicle && GameSA::GetPedZoomIndicator() >= 2) {
+                    g_Config.bIsometricEnabled = true;
+                    g_bCamInitialized = false;
+                    GameSA::AddHudMessage("~g~Camera Isometrica Ativada~w~ (Alt+Q/E gira os 4 lados)", 2200);
+                    Logger::Info("Botao de camera pressionado a pe: Modo Isometrico ATIVADO.");
+                } else if (bInVehicle && GameSA::GetCarZoomIndicator() >= 5) {
+                    g_Config.bIsometricEnabled = true;
+                    g_bCamInitialized = false;
+                    GameSA::AddHudMessage("~g~Camera Isometrica (Veiculo) Ativada", 2000);
+                    Logger::Info("Botao de camera pressionado em veiculo: Modo Isometrico ATIVADO.");
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // 10. CÁLCULO E APLICAÇÃO DA CÂMERA ISOMÉTRICA (CORE ENGINE)
+    // ========================================================================
+    static void ProcessIsometricCamera() {
+        CPlaceable* pPlayer = GameSA::FindPlayerPed(0);
+        if (!pPlayer) return;
+
+        CPlaceable* pVehicle = GameSA::FindPlayerVehicle(0, false);
+        HandleCameraControlsAndCycling(pPlayer, pVehicle);
+
+        if (!g_Config.bIsometricEnabled || ShouldYieldToNativeCamera(pPlayer)) {
             return;
-
-        char buf[1024];
-        vsnprintf(buf, sizeof(buf), fmt, args);
-
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-
-        const char* tag =
-            lvl == LogLevel::LDEBUG ? "DEBUG" :
-            lvl == LogLevel::LINFO  ? "INFO " :
-            lvl == LogLevel::LWARN  ? "AVISO" : "ERRO ";
-
-        m_file << "[" << std::setfill('0')
-               << std::setw(2) << st.wHour   << ":"
-               << std::setw(2) << st.wMinute << ":"
-               << std::setw(2) << st.wSecond << "."
-               << std::setw(3) << st.wMilliseconds
-               << "] [" << tag << "] " << buf << "\n";
-        m_file.flush(); // flush imediato: se o jogo crashar, nao perdemos a ultima linha
-    }
-
-    std::ofstream m_file;
-    bool m_verbose = true;
-};
-
-static Logger g_log;
-
-
-// ========================================================================
-//  SECAO 3 - DETECCAO DE OUTROS PLUGINS .ASI RODANDO JUNTO
-// ========================================================================
-
-static std::string GetModuleDirectory(HMODULE hModule)
-{
-    char path[MAX_PATH] = { 0 };
-    GetModuleFileNameA(hModule, path, MAX_PATH);
-    std::string s(path);
-    size_t pos = s.find_last_of("\\/");
-    return (pos == std::string::npos) ? std::string(".") : s.substr(0, pos);
-}
-
-// Varre os modulos (DLLs/ASI) atualmente carregados no processo do jogo e
-// registra no log todos os arquivos .asi encontrados em memoria. Isso
-// ajuda a identificar conflitos com outros mods (ex: dois mods tentando
-// controlar a camera ao mesmo tempo).
-static void LogLoadedAsiModules()
-{
-    g_log.Info("Escaneando modulos carregados no processo (procurando .asi)...");
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-    if (snap == INVALID_HANDLE_VALUE)
-    {
-        g_log.Warn("Nao foi possivel tirar snapshot dos modulos (Toolhelp32). Erro: %lu", GetLastError());
-        return;
-    }
-
-    MODULEENTRY32 me;
-    me.dwSize = sizeof(me);
-
-    int totalAsi = 0;
-    if (Module32First(snap, &me))
-    {
-        do
-        {
-            std::string name = me.szModule;
-            std::string lower = name;
-            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-
-            if (lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".asi") == 0)
-            {
-                totalAsi++;
-                g_log.Info("  [ASI em memoria] %-28s base=0x%p  caminho=%s",
-                           me.szModule, (void*)me.modBaseAddr, me.szExePath);
-            }
-        } while (Module32Next(snap, &me));
-    }
-    else
-    {
-        g_log.Warn("Module32First falhou. Erro: %lu", GetLastError());
-    }
-
-    CloseHandle(snap);
-    g_log.Info("Total de plugins .asi detectados em memoria: %d", totalAsi);
-}
-
-// Alem de olhar o que esta carregado em memoria, listamos tambem os
-// arquivos .asi presentes na raiz da pasta do jogo (podem existir mods
-// desativados, com extensao trocada, etc. - util para comparar).
-static void LogAsiFilesOnDisk(const std::string& gameDir)
-{
-    g_log.Info("Listando arquivos .asi na pasta do jogo: %s", gameDir.c_str());
-
-    std::string pattern = gameDir + "\\*.asi";
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-
-    int total = 0;
-    if (h != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            g_log.Info("  [arquivo em disco] %s", fd.cFileName);
-            total++;
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }
-
-    g_log.Info("Total de arquivos .asi na pasta do jogo: %d", total);
-}
-
-
-// ========================================================================
-//  SECAO 4 - CONFIGURACAO (IsoCam.ini ao lado do .asi)
-// ========================================================================
-
-struct IsoCamConfig
-{
-    bool  enabled               = true;   // liga/desliga o mod inteiro
-
-    // Geometria da camera isometrica
-    float distanceOnFoot        = 12.0f;  // distancia da camera ao player, a pe
-    float distanceInVehicle     = 18.0f;  // distancia da camera ao veiculo
-    float minDistance           = 5.0f;
-    float maxDistance           = 40.0f;
-    float distanceStep          = 1.5f;   // quanto cada toque +/- altera
-    float elevationDeg          = 35.264f;// angulo de elevacao (isometrico "verdadeiro")
-    float smoothSpeed           = 8.0f;   // velocidade da interpolacao (maior = mais rapido)
-
-    // Modo da camera isometrica dentro do veiculo
-    //   0 = Flexivel (acompanha a traseira do carro)
-    //   1 = Fixa     (mantem a direcao do mundo escolhida a pe)
-    int   vehicleCamMode        = 0;
-
-    // Quantidade de modos de camera NATIVOS do jogo antes do nosso modo
-    // extra entrar no ciclo. Precisa ser calibrado: ative o log, jogue,
-    // va apertando o botao de mudar camera e veja no log quantos valores
-    // diferentes aparecem para PedCameraMode e VehicleCameraMode antes de
-    // o ciclo nativo repetir. Veja o README.md.
-    int   nativeFootCamCount    = 2;
-    int   nativeVehicleCamCount = 3;
-
-    // Interiores
-    bool  interiorAutoAdjust    = true;
-    float interiorDistanceScale = 0.45f;
-
-    // Janela de tempo (ms) em que ignoramos mudancas no byte de modo de
-    // camera logo apos entrar/sair de um veiculo (o jogo realinha esse
-    // valor sozinho nessas horas, o que nao deve contar como "apertou o
-    // botao").
-    int   ignoreWindowMs        = 350;
-
-    // Pagina do menu de pausa correspondente a secao "Controles"
-    int   menuPageId            = MENUPAGE_CONTROLLER_PC_ID;
-
-    // Teclas (Virtual-Key codes do Windows)
-    int   keyToggleMod          = VK_F6;      // liga/desliga o mod inteiro (emergencia)
-    int   keyRotateNorth        = VK_NUMPAD8;
-    int   keyRotateEast         = VK_NUMPAD6;
-    int   keyRotateSouth        = VK_NUMPAD2;
-    int   keyRotateWest         = VK_NUMPAD4;
-    int   keyDistanceIn         = VK_NUMPAD7; // aproxima a camera
-    int   keyDistanceOut        = VK_NUMPAD9; // afasta a camera
-    int   keyToggleVehicleMode  = VK_F7;      // alterna Flexivel/Fixa (tambem ajustavel no menu)
-
-    bool  verboseLog            = true;
-};
-
-static IsoCamConfig g_cfg;
-
-static int ReadIntINI(const char* section, const char* key, int def, const char* file)
-{
-    return GetPrivateProfileIntA(section, key, def, file);
-}
-
-static float ReadFloatINI(const char* section, const char* key, float def, const char* file)
-{
-    char buf[64];
-    char defStr[64];
-    snprintf(defStr, sizeof(defStr), "%.3f", def);
-    GetPrivateProfileStringA(section, key, defStr, buf, sizeof(buf), file);
-    return (float)atof(buf);
-}
-
-static bool ReadBoolINI(const char* section, const char* key, bool def, const char* file)
-{
-    return ReadIntINI(section, key, def ? 1 : 0, file) != 0;
-}
-
-static void WriteIntINI(const char* section, const char* key, int value, const char* file)
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d", value);
-    WritePrivateProfileStringA(section, key, buf, file);
-}
-
-static void WriteFloatINI(const char* section, const char* key, float value, const char* file)
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.3f", value);
-    WritePrivateProfileStringA(section, key, buf, file);
-}
-
-static std::string g_iniPath;
-
-static void LoadConfig(const std::string& iniPath)
-{
-    const char* f = iniPath.c_str();
-
-    g_cfg.enabled               = ReadBoolINI ("IsoCam", "Enabled",               g_cfg.enabled,               f);
-    g_cfg.distanceOnFoot        = ReadFloatINI("IsoCam", "DistanceOnFoot",        g_cfg.distanceOnFoot,        f);
-    g_cfg.distanceInVehicle     = ReadFloatINI("IsoCam", "DistanceInVehicle",     g_cfg.distanceInVehicle,     f);
-    g_cfg.minDistance           = ReadFloatINI("IsoCam", "MinDistance",           g_cfg.minDistance,           f);
-    g_cfg.maxDistance           = ReadFloatINI("IsoCam", "MaxDistance",           g_cfg.maxDistance,           f);
-    g_cfg.distanceStep          = ReadFloatINI("IsoCam", "DistanceStep",          g_cfg.distanceStep,          f);
-    g_cfg.elevationDeg          = ReadFloatINI("IsoCam", "ElevationDeg",          g_cfg.elevationDeg,          f);
-    g_cfg.smoothSpeed           = ReadFloatINI("IsoCam", "SmoothSpeed",           g_cfg.smoothSpeed,           f);
-    g_cfg.vehicleCamMode        = ReadIntINI  ("IsoCam", "VehicleCamMode",        g_cfg.vehicleCamMode,        f);
-    g_cfg.nativeFootCamCount    = ReadIntINI  ("IsoCam", "NativeFootCamCount",    g_cfg.nativeFootCamCount,    f);
-    g_cfg.nativeVehicleCamCount = ReadIntINI  ("IsoCam", "NativeVehicleCamCount", g_cfg.nativeVehicleCamCount, f);
-    g_cfg.interiorAutoAdjust    = ReadBoolINI ("IsoCam", "InteriorAutoAdjust",    g_cfg.interiorAutoAdjust,    f);
-    g_cfg.interiorDistanceScale = ReadFloatINI("IsoCam", "InteriorDistanceScale", g_cfg.interiorDistanceScale, f);
-    g_cfg.ignoreWindowMs        = ReadIntINI  ("IsoCam", "IgnoreWindowMs",        g_cfg.ignoreWindowMs,        f);
-    g_cfg.menuPageId            = ReadIntINI  ("IsoCam", "MenuPageId",           g_cfg.menuPageId,            f);
-
-    g_cfg.keyToggleMod          = ReadIntINI("Keys", "ToggleMod",         g_cfg.keyToggleMod,         f);
-    g_cfg.keyRotateNorth        = ReadIntINI("Keys", "RotateNorth",       g_cfg.keyRotateNorth,       f);
-    g_cfg.keyRotateEast         = ReadIntINI("Keys", "RotateEast",        g_cfg.keyRotateEast,        f);
-    g_cfg.keyRotateSouth        = ReadIntINI("Keys", "RotateSouth",       g_cfg.keyRotateSouth,       f);
-    g_cfg.keyRotateWest         = ReadIntINI("Keys", "RotateWest",        g_cfg.keyRotateWest,        f);
-    g_cfg.keyDistanceIn         = ReadIntINI("Keys", "DistanceIn",        g_cfg.keyDistanceIn,        f);
-    g_cfg.keyDistanceOut        = ReadIntINI("Keys", "DistanceOut",       g_cfg.keyDistanceOut,       f);
-    g_cfg.keyToggleVehicleMode  = ReadIntINI("Keys", "ToggleVehicleMode", g_cfg.keyToggleVehicleMode, f);
-
-    g_cfg.verboseLog            = ReadBoolINI("IsoCam", "VerboseLog", g_cfg.verboseLog, f);
-
-    g_log.Info("Config carregada de %s", iniPath.c_str());
-    g_log.Info("  DistanceOnFoot=%.2f DistanceInVehicle=%.2f ElevationDeg=%.2f SmoothSpeed=%.2f",
-               g_cfg.distanceOnFoot, g_cfg.distanceInVehicle, g_cfg.elevationDeg, g_cfg.smoothSpeed);
-    g_log.Info("  VehicleCamMode=%d (0=Flexivel,1=Fixa) NativeFootCamCount=%d NativeVehicleCamCount=%d",
-               g_cfg.vehicleCamMode, g_cfg.nativeFootCamCount, g_cfg.nativeVehicleCamCount);
-}
-
-static void SaveVehicleCamMode()
-{
-    WriteIntINI("IsoCam", "VehicleCamMode", g_cfg.vehicleCamMode, g_iniPath.c_str());
-}
-
-static void SaveDistanceInVehicle()
-{
-    WriteFloatINI("IsoCam", "DistanceInVehicle", g_cfg.distanceInVehicle, g_iniPath.c_str());
-}
-
-static void SaveDistanceOnFoot()
-{
-    WriteFloatINI("IsoCam", "DistanceOnFoot", g_cfg.distanceOnFoot, g_iniPath.c_str());
-}
-
-
-// ========================================================================
-//  SECAO 5 - DEBOUNCE SIMPLES DE TECLAS (evita repetir 60x por segundo)
-// ========================================================================
-
-class KeyDebouncer
-{
-public:
-    // Retorna true apenas na transicao "solta -> pressionada", respeitando
-    // um cooldown minimo em milissegundos entre disparos repetidos.
-    bool JustPressed(int vk, DWORD cooldownMs = 150)
-    {
-        bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        DWORD now = GetTickCount();
-
-        State& st = m_state[vk];
-        bool fired = false;
-
-        if (down && !st.wasDown && (now - st.lastFire) >= cooldownMs)
-        {
-            fired = true;
-            st.lastFire = now;
         }
-        st.wasDown = down;
-        return fired;
-    }
 
-private:
-    struct State { bool wasDown = false; DWORD lastFire = 0; };
-    std::map<int, State> m_state;
-};
+        float dtSeconds = ClampVal(GameSA::GetTimeStep() / 50.0f, 0.001f, 0.1f);
+        bool bInVehicle = (pVehicle != nullptr);
+        bool bInInterior = IsPlayerInInterior(pPlayer);
 
-static KeyDebouncer g_keys;
+        CPlaceable* pFocusEntity = bInVehicle ? pVehicle : pPlayer;
+        CVector targetPos = pFocusEntity->GetPosition();
+        targetPos.z += bInVehicle ? 0.85f : 0.65f;
 
+        float targetYawRad = GetQuadrantYawRadians(g_Config.eCurrentQuadrant);
+        float targetPitchRad = (bInInterior ? ISO_INTERIOR_PITCH_DEG : ISO_DEFAULT_PITCH_DEG) * DEG2RAD;
 
-// ========================================================================
-//  SECAO 6 - ESTADO E LOGICA DA CAMERA ISOMETRICA
-// ========================================================================
-
-enum IsoSide : int { ISO_NORTH = 0, ISO_EAST = 90, ISO_SOUTH = 180, ISO_WEST = 270 };
-
-struct IsoCamState
-{
-    bool  modEnabled        = true;   // controlado pelo keyToggleMod
-
-    // "Extended index" dos ciclos de camera (a pe / veiculo). Quando o
-    // indice chega no ultimo valor (== contagem nativa), estamos no modo
-    // isometrico. Ver comentario na SECAO 1 sobre PedCameraMode/VehicleCameraMode.
-    int   footExtIndex      = 0;
-    int   vehExtIndex       = 0;
-    bool  isoActiveFoot     = false;
-    bool  isoActiveVehicle  = false;
-
-    BYTE  lastPedByte       = 0;
-    BYTE  lastVehByte       = 0;
-    bool  bytesInitialised  = false;
-
-    // Direcao isometrica "do mundo" escolhida pelo player (a pe e no modo
-    // veicular "Fixa" compartilham esse valor).
-    float worldAzimuthTarget  = (float)ISO_SOUTH; // olhando o player de frente por padrao
-    float currentAzimuth      = (float)ISO_SOUTH;
-    float currentDistance     = 12.0f;
-
-    DWORD lastTickMs         = 0;
-
-    // Controle de "janela de ignorar" ao entrar/sair de veiculo
-    DWORD vehicleTransitionAt = 0;
-    bool  wasInVehicleLastFrame = false;
-
-    bool  loggedEnterIsoFoot = false;
-    bool  loggedEnterIsoVeh  = false;
-};
-
-static IsoCamState g_state;
-
-// Calcula o vetor (a partir do alvo) de onde a camera deve ficar, dado um
-// azimute (0=Norte,90=Leste,180=Sul,270=Oeste), uma elevacao em graus e
-// uma distancia.
-static CVector ComputeIsoOffset(float azimuthDeg, float elevationDeg, float distance)
-{
-    float az = DegToRad(azimuthDeg);
-    float el = DegToRad(elevationDeg);
-
-    CVector dir;
-    dir.x = std::sin(az) * std::cos(el);
-    dir.y = std::cos(az) * std::cos(el);
-    dir.z = std::sin(el);
-
-    return CVector(dir.x * distance, dir.y * distance, dir.z * distance);
-}
-
-// Tenta obter o heading (graus) de um veiculo a partir da matriz de
-// orientacao (vetor "at"/frente). O sinal/eixo pode precisar de ajuste
-// fino conforme a convencao exata do CMatrix usado no seu plugin-sdk;
-// se a camera "Flexivel" girar para o lado errado, inverta o sinal do
-// atan2 abaixo (troque -at.x por at.x).
-static float GetVehicleHeadingDeg(CVehicle* veh)
-{
-    if (!veh || !veh->m_matrix)
-        return 0.0f;
-
-    const CVector& at = veh->m_matrix->at; // vetor "para frente" do veiculo
-    return RadToDeg(std::atan2(-at.x, at.y));
-}
-
-// Verifica se, neste exato frame, e seguro mexer na camera (sem cutscene
-// em andamento e sem o menu de pausa aberto). Mantemos a regra simples e
-// conservadora de proposito: qualquer uma dessas duas condicoes faz a
-// camera isometrica "congelar" na ultima posicao calculada e devolver o
-// quadro para o comportamento nativo do jogo, exatamente como a camera
-// normal tambem se comporta nessas situacoes. As teclas de ajuste (giro,
-// distancia, Flexivel/Fixa) continuam funcionando mesmo com o menu
-// aberto - e assim que o player consegue ajustar as opcoes enquanto ve o
-// painel na secao Controles (SECAO 7); so a reposicao da camera em si
-// fica pausada nesse meio tempo.
-static bool IsSafeToOverrideCamera()
-{
-    if (CCutsceneMgr::IsCutsceneProcessing())
-        return false;
-
-    if (FrontEndMenuManager.m_bMenuActive)
-        return false;
-
-    return true;
-}
-
-// Aplica de fato a posicao/orientacao calculada na camera do jogo.
-static void ApplyIsoCamera(const CVector& targetPos, float azimuthDeg, float distance)
-{
-    CVector offset = ComputeIsoOffset(azimuthDeg, g_cfg.elevationDeg, distance);
-    CVector camPos = targetPos + offset;
-    CVector upOffset(0.0f, 0.0f, 0.0f);
-
-    // Posiciona a camera (modo "fixo" nativo do jogo, o mesmo mecanismo
-    // usado por scripts de missao para cutscenes com camera parada).
-    TheCamera.SetCamPositionForFixedMode(camPos, upOffset);
-
-    // Aponta a camera para o alvo (player/veiculo). Usamos "jump cut" (1)
-    // porque QUEM faz a suavizacao somos nos mesmos, interpolando azimute
-    // e distancia antes de chegar aqui - deixar o motor interpolar de
-    // novo por cima so deixaria o movimento mais lento/estranho.
-    const int SWITCHTYPE_JUMPCUT = 1; // confira o enum SWITCHTYPE no seu CCamera.h se notar comportamento estranho
-    const int LOOKAT_MODE        = 1;
-    CVector lookAt = targetPos;
-    TheCamera.TakeControlNoEntity(&lookAt, SWITCHTYPE_JUMPCUT, LOOKAT_MODE);
-}
-
-// Le os bytes nativos de modo de camera e decide se o player "apertou" o
-// botao de mudar camera (a pe ou em veiculo), devolvendo true quando uma
-// mudanca de estado isometrico (entrar/sair) acabou de acontecer.
-static void UpdateCameraModeCycling(bool playerInVehicle)
-{
-    BYTE pedByte = *IsoAddr::PedCameraMode;
-    BYTE vehByte = *IsoAddr::VehicleCameraMode;
-
-    if (!g_state.bytesInitialised)
-    {
-        g_state.lastPedByte = pedByte;
-        g_state.lastVehByte = vehByte;
-        g_state.bytesInitialised = true;
-        return;
-    }
-
-    DWORD now = GetTickCount();
-    bool insideIgnoreWindow = (now - g_state.vehicleTransitionAt) < (DWORD)g_cfg.ignoreWindowMs;
-
-    if (!playerInVehicle)
-    {
-        if (pedByte != g_state.lastPedByte && !insideIgnoreWindow)
-        {
-            int cycleLen = g_cfg.nativeFootCamCount + 1; // +1 = nosso slot isometrico
-            g_state.footExtIndex = (g_state.footExtIndex + 1) % cycleLen;
-            bool wasActive = g_state.isoActiveFoot;
-            g_state.isoActiveFoot = (g_state.footExtIndex == g_cfg.nativeFootCamCount);
-
-            if (g_state.isoActiveFoot && !wasActive)
-                g_log.Info("[A PE] Camera isometrica ATIVADA (footExtIndex=%d).", g_state.footExtIndex);
-            else if (!g_state.isoActiveFoot && wasActive)
-            {
-                g_log.Info("[A PE] Camera isometrica DESATIVADA, devolvendo controle ao jogo.");
-                TheCamera.RestoreWithJumpCut();
+        if (bInVehicle && g_Config.eVehicleMode == VehicleIsoMode::FLEXIBLE_BEHIND_CAR) {
+            if (pVehicle->m_matrix) {
+                CVector vehForward = pVehicle->m_matrix->up;
+                float vehHeadingRad = std::atan2(-vehForward.x, vehForward.y);
+                targetYawRad = NormalizeAngleRad(vehHeadingRad + PI);
             }
         }
-    }
-    else
-    {
-        if (vehByte != g_state.lastVehByte && !insideIgnoreWindow)
-        {
-            int cycleLen = g_cfg.nativeVehicleCamCount + 1;
-            g_state.vehExtIndex = (g_state.vehExtIndex + 1) % cycleLen;
-            bool wasActive = g_state.isoActiveVehicle;
-            g_state.isoActiveVehicle = (g_state.vehExtIndex == g_cfg.nativeVehicleCamCount);
 
-            if (g_state.isoActiveVehicle && !wasActive)
-                g_log.Info("[VEICULO] Camera isometrica ATIVADA (vehExtIndex=%d, modo=%s).",
-                           g_state.vehExtIndex, g_cfg.vehicleCamMode == 0 ? "Flexivel" : "Fixa");
-            else if (!g_state.isoActiveVehicle && wasActive)
-            {
-                g_log.Info("[VEICULO] Camera isometrica DESATIVADA, devolvendo controle ao jogo.");
-                TheCamera.RestoreWithJumpCut();
+        float desiredDist = g_Config.fViewDistance;
+        if (bInInterior) {
+            desiredDist = ClampVal(desiredDist * g_Config.fInteriorDistanceScale, 4.5f, 12.0f);
+        } else if (bInVehicle) {
+            float speedMag = GameSA::GetEntityMoveSpeed(pVehicle).Magnitude();
+            desiredDist += ClampVal(speedMag * 6.5f, 0.0f, 6.0f);
+        }
+
+        if (!g_bCamInitialized) {
+            g_CurrentCamPos = GameSA::GetCameraPlaceable()->GetPosition();
+            g_CurrentLookAt = targetPos;
+            g_CurrentYawRad = targetYawRad;
+            g_CurrentPitchRad = targetPitchRad;
+            g_CurrentDist = desiredDist;
+            g_bCamInitialized = true;
+        }
+
+        float rotLerpFactor = 1.0f - std::exp(-g_Config.fRotationSmoothSpeed * dtSeconds);
+        g_CurrentYawRad = LerpAngleRad(g_CurrentYawRad, targetYawRad, rotLerpFactor);
+        g_CurrentPitchRad = LerpAngleRad(g_CurrentPitchRad, targetPitchRad, rotLerpFactor);
+        g_CurrentDist = g_CurrentDist + (desiredDist - g_CurrentDist) * rotLerpFactor;
+
+        float horizontalRadius = g_CurrentDist * std::cos(g_CurrentPitchRad);
+        float verticalHeight = g_CurrentDist * std::sin(g_CurrentPitchRad);
+
+        CVector idealCamOffset(
+            std::sin(g_CurrentYawRad) * horizontalRadius,
+            -std::cos(g_CurrentYawRad) * horizontalRadius,
+            verticalHeight
+        );
+
+        CVector idealCamPos = targetPos + idealCamOffset;
+
+        // RayCast para adaptação em interiores e prevenção de colisão com tetos/paredes
+        CColPoint colPoint;
+        void* pColEntity = nullptr;
+        bool bHitObstacle = GameSA::ProcessLineOfSight(
+            targetPos, idealCamPos, colPoint, pColEntity,
+            true, false, false, true, false, true, true, false
+        );
+
+        if (bHitObstacle) {
+            CVector hitVec = colPoint.m_vecPoint - targetPos;
+            float hitDist = hitVec.Magnitude();
+            if (hitDist > 1.8f) {
+                hitVec.Normalise();
+                idealCamPos = targetPos + hitVec * (hitDist - 0.45f);
+            } else {
+                idealCamPos = colPoint.m_vecPoint;
             }
         }
+
+        float posSpeed = bHitObstacle ? g_Config.fCollisionPullInSpeed : g_Config.fPositionSmoothSpeed;
+        g_CurrentCamPos = SmoothLerpVector(g_CurrentCamPos, idealCamPos, posSpeed, dtSeconds);
+        g_CurrentLookAt = SmoothLerpVector(g_CurrentLookAt, targetPos, g_Config.fPositionSmoothSpeed * 1.4f, dtSeconds);
+
+        CVector vecForward = g_CurrentLookAt - g_CurrentCamPos;
+        if (vecForward.Magnitude() < 0.001f) {
+            vecForward = CVector(0.0f, 1.0f, -0.5f);
+        }
+        vecForward.Normalise();
+
+        CVector worldUp(0.0f, 0.0f, 1.0f);
+        CVector vecRight = CrossProduct(worldUp, vecForward);
+        if (vecRight.Magnitude() < 0.001f) {
+            vecRight = CVector(1.0f, 0.0f, 0.0f);
+        }
+        vecRight.Normalise();
+
+        CVector vecUp = CrossProduct(vecForward, vecRight);
+        vecUp.Normalise();
+
+        CCam& activeCam = GameSA::GetActiveCam();
+        activeCam.m_vecSource = g_CurrentCamPos;
+        activeCam.m_vecFront = vecForward;
+        activeCam.m_vecUp = vecUp;
+        activeCam.m_vecTargetCoorsForFudgeInter = g_CurrentLookAt;
+        activeCam.m_fFOV = g_Config.fFOV;
+
+        CPlaceable* pCamPlaceable = GameSA::GetCameraPlaceable();
+        if (pCamPlaceable && pCamPlaceable->m_matrix) {
+            pCamPlaceable->m_matrix->right = vecRight;
+            pCamPlaceable->m_matrix->up = vecForward;
+            pCamPlaceable->m_matrix->at = vecUp;
+            pCamPlaceable->m_matrix->pos = g_CurrentCamPos;
+            pCamPlaceable->m_matrix->UpdateRW();
+        }
+        GameSA::SetRwCamPosition();
+        GameSA::CalculateDerivedValues(false, true);
+        GameSA::SetCameraOrientation(g_CurrentYawRad);
     }
 
-    g_state.lastPedByte = pedByte;
-    g_state.lastVehByte = vehByte;
+    // ========================================================================
+    // 11. INTEGRAÇÃO AO MENU DE PAUSA -> SESSÃO CONTROLES (ID 37)
+    // ========================================================================
+    static void ProcessPauseMenuControlsInjection() {
+        if (!GameSA::IsMenuActive() || GameSA::GetCurrentMenuPage() != MENUPAGE_CONTROLLER_PC_ID) {
+            g_MenuSelectedCustomRow = -1;
+            return;
+        }
+
+        float scaleX = static_cast<float>(GameSA::GetScreenWidth()) / 640.0f;
+        float scaleY = static_cast<float>(GameSA::GetScreenHeight()) / 448.0f;
+
+        float basePosX = 68.0f * scaleX;
+        float valuePosX = 572.0f * scaleX;
+        float row0PosY = 308.0f * scaleY;
+        float row1PosY = 334.0f * scaleY;
+        float row2PosY = 360.0f * scaleY;
+
+        float mouseY = static_cast<float>(GameSA::GetMenuMousePosY());
+        if (mouseY >= row0PosY - (6.0f * scaleY) && mouseY < row1PosY - (4.0f * scaleY)) {
+            g_MenuSelectedCustomRow = 0;
+        } else if (mouseY >= row1PosY - (4.0f * scaleY) && mouseY < row2PosY - (4.0f * scaleY)) {
+            g_MenuSelectedCustomRow = 1;
+        } else if (mouseY >= row2PosY - (4.0f * scaleY) && mouseY < row2PosY + (22.0f * scaleY)) {
+            g_MenuSelectedCustomRow = 2;
+        }
+
+        static bool bPrevLeft = false, bPrevRight = false, bPrevEnter = false, bPrevTab = false;
+        bool bLeftDown = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0 || (GetAsyncKeyState('A') & 0x8000) != 0;
+        bool bRightDown = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0 || (GetAsyncKeyState('D') & 0x8000) != 0;
+        bool bEnterDown = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0 || (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        bool bTabDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+
+        if (bTabDown && !bPrevTab) {
+            g_MenuSelectedCustomRow = (g_MenuSelectedCustomRow + 1) % 3;
+        }
+        bPrevTab = bTabDown;
+
+        if (g_MenuSelectedCustomRow == 0) {
+            if ((bLeftDown && !bPrevLeft) || (bRightDown && !bPrevRight) || (bEnterDown && !bPrevEnter)) {
+                g_Config.eVehicleMode = (g_Config.eVehicleMode == VehicleIsoMode::FLEXIBLE_BEHIND_CAR)
+                    ? VehicleIsoMode::FIXED_PERSPECTIVE
+                    : VehicleIsoMode::FLEXIBLE_BEHIND_CAR;
+                ConfigManager::Save();
+                Logger::Info("Menu Controles: Modo de camera de veiculo alterado para %d", static_cast<int>(g_Config.eVehicleMode));
+            }
+        } else if (g_MenuSelectedCustomRow == 1) {
+            if (bLeftDown && !bPrevLeft) {
+                g_Config.fViewDistance = ClampVal(g_Config.fViewDistance - 2.5f, g_Config.fMinDistance, g_Config.fMaxDistance);
+                ConfigManager::Save();
+            } else if ((bRightDown && !bPrevRight) || (bEnterDown && !bPrevEnter)) {
+                g_Config.fViewDistance += 2.5f;
+                if (g_Config.fViewDistance > g_Config.fMaxDistance) g_Config.fViewDistance = g_Config.fMinDistance;
+                ConfigManager::Save();
+            }
+        } else if (g_MenuSelectedCustomRow == 2) {
+            if ((bLeftDown && !bPrevLeft) || (bRightDown && !bPrevRight) || (bEnterDown && !bPrevEnter)) {
+                int delta = (bLeftDown && !bPrevLeft) ? 3 : 1;
+                g_Config.eCurrentQuadrant = static_cast<IsoQuadrant>((static_cast<int>(g_Config.eCurrentQuadrant) + delta) % 4);
+                ConfigManager::Save();
+            }
+        }
+
+        bPrevLeft = bLeftDown;
+        bPrevRight = bRightDown;
+        bPrevEnter = bEnterDown;
+
+        GameSA::FontSetBackground(false, false);
+        GameSA::FontSetWrapx(620.0f * scaleX);
+        GameSA::FontSetFontStyle(2); // FONT_MENU
+        GameSA::FontSetProportional(true);
+        GameSA::FontSetDropShadowPosition(1);
+        GameSA::FontSetDropColor(CRGBA(0, 0, 0, 220));
+        GameSA::FontSetScale(0.42f * scaleX, 0.88f * scaleY);
+
+        // Linha 0: Modo de Câmera de Veículo
+        GameSA::FontSetColor(g_MenuSelectedCustomRow == 0 ? CRGBA(225, 225, 255, 255) : CRGBA(145, 165, 190, 235));
+        GameSA::FontSetOrientation(1); // ALIGN_LEFT
+        GameSA::FontPrintString(basePosX, row0PosY, "CAM. VEICULO ISOMETRICA");
+        GameSA::FontSetOrientation(2); // ALIGN_RIGHT
+        GameSA::FontPrintString(valuePosX, row0PosY,
+            g_Config.eVehicleMode == VehicleIsoMode::FLEXIBLE_BEHIND_CAR
+                ? "PERSPECTIVA FLEXIVEL (ATRAS)"
+                : "PERSPECTIVA FIXA (A PE)");
+
+        // Linha 1: Distância de Visão
+        GameSA::FontSetColor(g_MenuSelectedCustomRow == 1 ? CRGBA(225, 225, 255, 255) : CRGBA(145, 165, 190, 235));
+        GameSA::FontSetOrientation(1);
+        GameSA::FontPrintString(basePosX, row1PosY, "DISTANCIA DE VISAO ISOMETRICA");
+        char distText[64];
+        int numBars = static_cast<int>(((g_Config.fViewDistance - g_Config.fMinDistance) / (g_Config.fMaxDistance - g_Config.fMinDistance)) * 10.0f);
+        snprintf(distText, sizeof(distText), "< %.1f METROS [Barra %d/10] >", g_Config.fViewDistance, numBars);
+        GameSA::FontSetOrientation(2);
+        GameSA::FontPrintString(valuePosX, row1PosY, distText);
+
+        // Linha 2: Lado da Perspectiva (4 Quadrantes)
+        GameSA::FontSetColor(g_MenuSelectedCustomRow == 2 ? CRGBA(225, 225, 255, 255) : CRGBA(145, 165, 190, 235));
+        GameSA::FontSetOrientation(1);
+        GameSA::FontPrintString(basePosX, row2PosY, "LADO DA PERSPECTIVA (ALT+Q/E)");
+        GameSA::FontSetOrientation(2);
+        GameSA::FontPrintString(valuePosX, row2PosY, GetQuadrantName(g_Config.eCurrentQuadrant));
+    }
+
+    // ========================================================================
+    // 12. SISTEMA DE HOOKS NATIVOS X86 (SEM DEPENDÊNCIAS EXTERNAS)
+    // ========================================================================
+    typedef void(__thiscall* fnCCameraProcess)(void*);
+    static fnCCameraProcess g_OrigCameraProcess = nullptr;
+
+    static void __fastcall Hooked_CCamera_Process(void* pThis, void* /*edx*/) {
+        if (g_OrigCameraProcess) {
+            g_OrigCameraProcess(pThis);
+        }
+        ProcessIsometricCamera();
+    }
+
+    typedef void(__thiscall* fnMenuDrawFrontEnd)(void*);
+    static fnMenuDrawFrontEnd g_OrigMenuDrawFrontEnd = nullptr;
+
+    static void __fastcall Hooked_CMenuManager_DrawFrontEnd(void* pThis, void* /*edx*/) {
+        if (g_OrigMenuDrawFrontEnd) {
+            g_OrigMenuDrawFrontEnd(pThis);
+        }
+        ProcessPauseMenuControlsInjection();
+    }
+
+    static uintptr_t InstallRelativeCallHook(uintptr_t callInstructionAddr, uintptr_t newTargetAddr) {
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(callInstructionAddr), 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            return 0;
+        }
+        int32_t origRelOffset = *reinterpret_cast<int32_t*>(callInstructionAddr + 1);
+        uintptr_t origTargetAddr = callInstructionAddr + 5 + origRelOffset;
+
+        int32_t newRelOffset = static_cast<int32_t>(newTargetAddr - (callInstructionAddr + 5));
+        *reinterpret_cast<int32_t*>(callInstructionAddr + 1) = newRelOffset;
+
+        VirtualProtect(reinterpret_cast<void*>(callInstructionAddr), 5, oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(callInstructionAddr), 5);
+        return origTargetAddr;
+    }
+
+    static DWORD WINAPI DeferredInitThread(LPVOID /*lpParam*/) {
+        // Aguarda o loop principal do GTA SA 1.0 US inicializar
+        Sleep(1500);
+
+        Logger::Init(g_hThisModule);
+        g_VehHandle = AddVectoredExceptionHandler(1, VectoredCrashHandler);
+
+        if (!VerifyGameVersion10US()) {
+            return 0;
+        }
+
+        ConfigManager::Load();
+        AsiScanner::ScanLoadedModules();
+
+        // 1. Hook na chamada de CCamera::Process dentro de CGame::Process (0x53C09A no GTA SA 1.0 US)
+        g_OrigCameraProcess = reinterpret_cast<fnCCameraProcess>(
+            InstallRelativeCallHook(0x53C09A, reinterpret_cast<uintptr_t>(&Hooked_CCamera_Process))
+        );
+
+        // 2. Hook na chamada de CMenuManager::DrawFrontEnd (0x53EB9D no GTA SA 1.0 US)
+        g_OrigMenuDrawFrontEnd = reinterpret_cast<fnMenuDrawFrontEnd>(
+            InstallRelativeCallHook(0x53EB9D, reinterpret_cast<uintptr_t>(&Hooked_CMenuManager_DrawFrontEnd))
+        );
+
+        Logger::Info("Hooks x86 instalados com sucesso (CCamera::Process=0x%08X, DrawFrontEnd=0x%08X).",
+                     reinterpret_cast<uintptr_t>(g_OrigCameraProcess),
+                     reinterpret_cast<uintptr_t>(g_OrigMenuDrawFrontEnd));
+        return 0;
+    }
+
+} // namespace IsometricCamMod
+
+// Ponto de entrada padrão da DLL (.asi) no Windows
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        IsometricCamMod::g_hThisModule = hModule;
+        CreateThread(nullptr, 0, IsometricCamMod::DeferredInitThread, nullptr, 0, nullptr);
+    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        IsometricCamMod::ConfigManager::Save();
+        if (IsometricCamMod::g_VehHandle) {
+            RemoveVectoredExceptionHandler(IsometricCamMod::g_VehHandle);
+            IsometricCamMod::g_VehHandle = nullptr;
+        }
+        IsometricCamMod::Logger::Shutdown();
+    }
+    return TRUE;
 }
-
-// Le as teclas de rotacao (4 lados) e de distancia, atualizando os alvos
-// de interpolacao. Nao aplica nada diretamente na camera aqui.
-static void UpdateHotkeys(bool playerInVehicle, bool isoActiveNow)
-{
-    // Toggle geral do mod - sempre ativo, mesmo com a camera isometrica
-    // desligada, para servir como "botao de panico".
-    if (g_keys.JustPressed(g_cfg.keyToggleMod, 400))
-    {
-        g_state.modEnabled = !g_state.modEnabled;
-        g_log.Info("Mod IsoCam %s via tecla de atalho.", g_state.modEnabled ? "ATIVADO" : "DESATIVADO");
-        if (!g_state.modEnabled)
-            TheCamera.RestoreWithJumpCut();
-    }
-
-    if (!g_state.modEnabled)
-        return;
-
-    // Giro entre os 4 lados (funciona a pe sempre; em veiculo so quando o
-    // modo "Fixa" esta selecionado, ja que no "Flexivel" quem manda na
-    // direcao e o proprio carro).
-    bool canRotateManually = !playerInVehicle || g_cfg.vehicleCamMode == 1;
-    if (canRotateManually)
-    {
-        if (g_keys.JustPressed(g_cfg.keyRotateNorth, 150)) { g_state.worldAzimuthTarget = (float)ISO_NORTH; g_log.Debug("Lado isometrico -> NORTE"); }
-        if (g_keys.JustPressed(g_cfg.keyRotateEast , 150)) { g_state.worldAzimuthTarget = (float)ISO_EAST;  g_log.Debug("Lado isometrico -> LESTE");  }
-        if (g_keys.JustPressed(g_cfg.keyRotateSouth, 150)) { g_state.worldAzimuthTarget = (float)ISO_SOUTH; g_log.Debug("Lado isometrico -> SUL");   }
-        if (g_keys.JustPressed(g_cfg.keyRotateWest , 150)) { g_state.worldAzimuthTarget = (float)ISO_WEST;  g_log.Debug("Lado isometrico -> OESTE"); }
-    }
-
-    // Distancia de visao (+ / -). Funciona a qualquer momento (inclusive
-    // com o menu de pausa aberto na secao Controles), para que o player
-    // veja os valores do painel (SECAO 7) mudando em tempo real.
-    {
-        float* dist = playerInVehicle ? &g_cfg.distanceInVehicle : &g_cfg.distanceOnFoot;
-        bool changed = false;
-
-        if (g_keys.JustPressed(g_cfg.keyDistanceIn, 90))
-        {
-            *dist = ClampF(*dist - g_cfg.distanceStep, g_cfg.minDistance, g_cfg.maxDistance);
-            changed = true;
-        }
-        if (g_keys.JustPressed(g_cfg.keyDistanceOut, 90))
-        {
-            *dist = ClampF(*dist + g_cfg.distanceStep, g_cfg.minDistance, g_cfg.maxDistance);
-            changed = true;
-        }
-
-        if (changed)
-        {
-            g_log.Debug("Distancia isometrica (%s) -> %.2f", playerInVehicle ? "veiculo" : "a pe", *dist);
-            playerInVehicle ? SaveDistanceInVehicle() : SaveDistanceOnFoot();
-        }
-    }
-
-    // Alterna Flexivel/Fixa (tambem disponivel como opcao no menu de pausa, secao Controles)
-    if (playerInVehicle && g_keys.JustPressed(g_cfg.keyToggleVehicleMode, 250))
-    {
-        g_cfg.vehicleCamMode = 1 - g_cfg.vehicleCamMode;
-        SaveVehicleCamMode();
-        g_log.Info("Modo de camera veicular isometrica alterado para: %s",
-                   g_cfg.vehicleCamMode == 0 ? "Flexivel" : "Fixa");
-    }
-}
-
-// Logica principal, chamada uma vez por frame, DEPOIS do processamento
-// normal do jogo (Events::gameProcessEvent.after), ou seja, depois que a
-// camera nativa ja calculou sua posicao "normal" para este frame. Assim
-// nossa sobrescrita sempre tem a ultima palavra quando o modo isometrico
-// esta ativo, sem brigar com o calculo nativo no meio do caminho.
-static void UpdateInternal()
-{
-    DWORD now = GetTickCount();
-    float dt = g_state.lastTickMs == 0 ? 0.016f : (now - g_state.lastTickMs) / 1000.0f;
-    dt = ClampF(dt, 0.0f, 0.1f); // evita saltos grandes apos hitches/loading
-    g_state.lastTickMs = now;
-
-    CPed* player = FindPlayerPed();
-    if (!player)
-        return;
-
-    CVehicle* vehicle = FindPlayerVehicle();
-    bool playerInVehicle = (vehicle != nullptr);
-
-    // Deteccao de transicao entrar/sair de veiculo, para abrir a "janela
-    // de ignorar" mudancas espurias no byte de modo de camera.
-    if (playerInVehicle != g_state.wasInVehicleLastFrame)
-    {
-        g_state.vehicleTransitionAt = now;
-        g_log.Debug("Transicao de veiculo detectada (agora %s veiculo). Ignorando mudancas de modo de camera por %d ms.",
-                    playerInVehicle ? "DENTRO do" : "FORA do", g_cfg.ignoreWindowMs);
-    }
-    g_state.wasInVehicleLastFrame = playerInVehicle;
-
-    UpdateCameraModeCycling(playerInVehicle);
-
-    bool isoActiveNow = playerInVehicle ? g_state.isoActiveVehicle : g_state.isoActiveFoot;
-
-    UpdateHotkeys(playerInVehicle, isoActiveNow);
-
-    if (!isoActiveNow || !g_state.modEnabled)
-        return;
-
-    if (!IsSafeToOverrideCamera())
-    {
-        g_log.Debug("Frame ignorado pela camera isometrica (cutscene/script camera ativa).");
-        return;
-    }
-
-    // --- Define o alvo (posicao a olhar) e o azimute desejado ---
-    CVector targetPos;
-    float targetAzimuth;
-    float targetDistance;
-    bool inInterior = (CGame::currArea != 0);
-
-    if (playerInVehicle)
-    {
-        targetPos = vehicle->GetPosition();
-        targetPos.z += 1.0f; // mira um pouco acima do centro do veiculo
-
-        if (g_cfg.vehicleCamMode == 0) // Flexivel: acompanha a traseira do carro
-        {
-            targetAzimuth = GetVehicleHeadingDeg(vehicle) + 180.0f;
-        }
-        else // Fixa: mantem a direcao do mundo escolhida pelo player
-        {
-            targetAzimuth = g_state.worldAzimuthTarget;
-        }
-
-        targetDistance = g_cfg.distanceInVehicle;
-
-        if (!g_state.loggedEnterIsoVeh)
-        {
-            g_log.Info("Camera isometrica veicular comecou a renderizar (modo=%s).",
-                       g_cfg.vehicleCamMode == 0 ? "Flexivel" : "Fixa");
-            g_state.loggedEnterIsoVeh = true;
-        }
-        g_state.loggedEnterIsoFoot = false;
-    }
-    else
-    {
-        targetPos = player->GetPosition();
-        targetPos.z += 0.9f; // mira na altura do torso/peito
-
-        targetAzimuth = g_state.worldAzimuthTarget;
-        targetDistance = g_cfg.distanceOnFoot;
-
-        if (!g_state.loggedEnterIsoFoot)
-        {
-            g_log.Info("Camera isometrica a pe comecou a renderizar.");
-            g_state.loggedEnterIsoFoot = true;
-        }
-        g_state.loggedEnterIsoVeh = false;
-    }
-
-    // Adaptacao automatica para interiores: reduz a distancia para evitar
-    // atravessar paredes/tetos de comodos pequenos.
-    if (inInterior && g_cfg.interiorAutoAdjust)
-        targetDistance *= g_cfg.interiorDistanceScale;
-
-    // --- Interpolacao suave em direcao ao alvo ---
-    float t = ClampF(dt * g_cfg.smoothSpeed, 0.0f, 1.0f);
-    g_state.currentAzimuth  = LerpAngleDeg(g_state.currentAzimuth, targetAzimuth, t);
-    g_state.currentDistance = Lerp(g_state.currentDistance, targetDistance, t);
-
-    ApplyIsoCamera(targetPos, g_state.currentAzimuth, g_state.currentDistance);
-}
-
-// Wrapper com protecao contra excecoes estruturadas (SEH). Como lemos e
-// escrevemos em enderecos de memoria "crus", um deslocamento de versao
-// do jogo poderia causar um Access Violation; aqui capturamos isso,
-// registramos no log e desligamos a camera isometrica neste frame em vez
-// de derrubar o jogo inteiro.
-static void SafeUpdate()
-{
-    __try
-    {
-        UpdateInternal();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        DWORD code = GetExceptionCode();
-        g_log.Error("EXCECAO capturada em IsoCam::UpdateInternal (codigo 0x%08lX). "
-                     "A camera isometrica foi desativada neste frame por seguranca. "
-                     "Isso geralmente indica que um endereco de memoria nao bate com "
-                     "sua copia do jogo/plugin-sdk - revise o README.md.", code);
-        g_state.isoActiveFoot = false;
-        g_state.isoActiveVehicle = false;
-    }
-}
-
-
-// ========================================================================
-//  SECAO 7 - PAINEL NO MENU DE PAUSA (secao Controles)
-// ========================================================================
-
-// Desenha um pequeno painel informativo/editavel sobre a camera
-// isometrica quando o player esta na pagina "Controles" do menu de pausa.
-// Usamos teclas dedicadas (nao as setas nativas do menu) para nao brigar
-// com a navegacao normal do jogo nessa tela.
-static void DrawPauseMenuPanel()
-{
-    if (!FrontEndMenuManager.m_bMenuActive)
-        return;
-
-    if (!IsOnControlsPage(FrontEndMenuManager.m_nCurrScreen))
-        return;
-
-    char line1[128];
-    char line2[128];
-    char line3[128];
-    snprintf(line1, sizeof(line1), "IsoCam - Camera Isometrica (F6 liga/desliga: %s)",
-             g_state.modEnabled ? "ATIVO" : "DESATIVADO");
-    snprintf(line2, sizeof(line2), "Veiculo: [F7] Modo = %s",
-             g_cfg.vehicleCamMode == 0 ? "Flexivel (acompanha o carro)" : "Fixa (direcao do mundo)");
-    snprintf(line3, sizeof(line3), "Distancia: [Numpad7/9] A pe=%.1f  Veiculo=%.1f  (min %.1f / max %.1f)",
-             g_cfg.distanceOnFoot, g_cfg.distanceInVehicle, g_cfg.minDistance, g_cfg.maxDistance);
-
-    // CRect(esquerda, topo, direita, base) em coordenadas de tela do menu.
-    // Os valores abaixo posicionam o painel no canto inferior esquerdo;
-    // ajuste conforme a resolucao/layout do seu menu se necessario.
-    CRect box(20.0f, 400.0f, 420.0f, 470.0f);
-    CRGBA bg(0, 0, 0, 180);
-
-    FrontEndMenuManager.DrawWindow(box, const_cast<char*>(line1), 1, bg, 0, 0);
-    // Linhas adicionais desenhadas como "janelas" extras logo abaixo da primeira.
-    CRect box2(20.0f, 430.0f, 420.0f, 450.0f);
-    CRect box3(20.0f, 450.0f, 420.0f, 470.0f);
-    FrontEndMenuManager.DrawWindow(box2, const_cast<char*>(line2), 1, bg, 0, 0);
-    FrontEndMenuManager.DrawWindow(box3, const_cast<char*>(line3), 1, bg, 0, 0);
-}
-
-
-// ========================================================================
-//  SECAO 8 - INICIALIZACAO DO PLUGIN
-// ========================================================================
-
-class IsoCamPlugin
-{
-public:
-    IsoCamPlugin()
-    {
-        Events::initGameEvent += [] { OnGameInit(); };
-        Events::gameProcessEvent.after += [] { SafeUpdate(); DrawPauseMenuPanel(); };
-    }
-
-private:
-    static void OnGameInit()
-    {
-        HMODULE hSelf = GetModuleHandleA("IsoCam.asi");
-        std::string dir = GetModuleDirectory(hSelf);
-
-        g_iniPath = dir + "\\IsoCam.ini";
-        std::string logPath = dir + "\\IsoCam.log";
-
-        // O log e aberto antes de carregar a config para podermos
-        // registrar o proprio carregamento da config.
-        g_log.Init(logPath, true);
-
-        LoadConfig(g_iniPath);
-        g_log.SetVerbose(g_cfg.verboseLog); // ajusta o nivel de log conforme a config, sem reabrir o arquivo
-
-        g_state.currentDistance   = g_cfg.distanceOnFoot;
-        g_state.currentAzimuth    = g_state.worldAzimuthTarget;
-        g_state.modEnabled        = g_cfg.enabled;
-
-        g_log.Info("GTA SA 1.0 US detectado pelo plugin-sdk. IsoCam pronto.");
-        LogLoadedAsiModules();
-        LogAsiFilesOnDisk(dir);
-    }
-};
-
-static IsoCamPlugin g_isoCamPlugin;
