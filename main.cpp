@@ -3,10 +3,27 @@
 #include <windows.h>
 #include <cstdio>
 #include <cmath>
+#include <cstdint>
 
-// Endereços fixos GTA SA 1.0 US
+// Estruturas Nativas Básicas do GTA SA 1.0 US
+struct CVector {
+    float x, y, z;
+    CVector() : x(0.0f), y(0.0f), z(0.0f) {}
+    CVector(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
+};
+
+// Endereços globais do GTA SA 1.0 US
+#define FUNC_CCamera_Process 0x53C040
+#define ADDR_TheCamera       0xB6F028
+
 typedef void(__cdecl* CCamera_Process_t)();
-CCamera_Process_t OrgnalCameraProcess = (CCamera_Process_t0x53C040);
+CCamera_Process_t OriginalCameraProcess = (CCamera_Process_t)FUNC_CCamera_Process;
+
+// Variáveis de Estado da Câmera Isométrica
+static bool bIsoCameraActive = true;
+static int nIsoSide = 0; // 0: 45°, 1: 135°, 2: 225°, 3: 315°
+static float fIsoDistance = 18.0f;
+static float fIsoPitch = 38.0f * (3.14159265f / 180.0f);
 
 void LogDebug(const char* format, ...) {
     char path[MAX_PATH];
@@ -26,19 +43,31 @@ void LogDebug(const char* format, ...) {
     }
 }
 
+void ApplyIsometricCamera() {
+    if (!bIsoCameraActive) return;
+
+    // Ponteiro global da TheCamera (0xB6F028)
+    uint8_t* pCamera = *(uint8_t**)ADDR_TheCamera;
+    if (!pCamera) return;
+
+    // Leitura das teclas para alternar os 4 lados da perspectiva (Alt + Q / Alt + E)
+    if ((GetAsyncKeyState('Q') & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        nIsoSide = (nIsoSide + 3) % 4;
+        Sleep(150); // Debounce simples
+    }
+    if ((GetAsyncKeyState('E') & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        nIsoSide = (nIsoSide + 1) % 4;
+        Sleep(150);
+    }
+}
+
 void HookedCameraProcess() {
-    // Lógica da câmera isométrica aplicada aqui com segurança
-    OrgnalCameraProcess();
+    ApplyIsometricCamera();
+    OriginalCameraProcess();
 }
 
 void PatchInit() {
-    LogDebug("[INFO] IsometricCameraSA carregado com sucesso no executável Hoodlum.");
-    
-    // Redirecionamento seguro via VirtualProtect
-    DWORD oldProtect;
-    VirtualProtect((LPVOID)0x53C040, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-    // Aqui aplicamos o hook de forma limpa sem depender de assinaturas rígidas
-    VirtualProtect((LPVOID)0x53C040, 5, oldProtect, &oldProtect);
+    LogDebug("[INFO] IsometricCameraSA inicializada com sucesso no Hoodlum.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
