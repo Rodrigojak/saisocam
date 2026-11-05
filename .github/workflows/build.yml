@@ -1,25 +1,18 @@
-name: Build IsoCam ASI
+name: Build ASI Mod
 
-on: [push, workflow_dispatch]
+on: [push, pull_request]
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Inicializar Ferramentas de Compilação MSVC (x86)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x86
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
 
-      - name: Compilar IsoCam.asi
-        shell: cmd
-        run: |
-          cl /EHsc /LD /O2 main.cpp user32.lib /link /OUT:IsoCam.asi
-
-      - name: Disponibilizar IsoCam.asi para Download
-        uses: actions/upload-artifact@v4
-        with:
-          name: IsoCam-ASI
-          path: IsoCam.asi
+    - name: Compile DLL / ASI
+      run: |
+        cl /EHsc /LD /O2 main.cpp user32.lib d3d9.lib d3dx9.lib /link /OUT:IsoCam.asi
