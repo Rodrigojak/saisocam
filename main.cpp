@@ -259,12 +259,11 @@ namespace IsometricCamMod {
         );
     }
 
-    // Função de controle segura baseada na tecla 'Z' para alternar a câmera
     static void HandleInput() {
         if (GameSA::IsMenuActive()) return;
 
         static bool bPrevKeyState = false;
-        bool bCurrKeyState = (GetAsyncKeyState('Z') & 0x8000) != 0; // Tecla Z alterna a isométrica
+        bool bCurrKeyState = (GetAsyncKeyState('Z') & 0x8000) != 0;
 
         if (bCurrKeyState && !bPrevKeyState) {
             g_Config.bIsometricEnabled = !g_Config.bIsometricEnabled;
@@ -346,4 +345,38 @@ namespace IsometricCamMod {
         if (pCamPlaceable && pCamPlaceable->m_matrix) {
             pCamPlaceable->m_matrix->right = vecRight;
             pCamPlaceable->m_matrix->up = vecForward;
-            pCamPlaceable->m_matrix->at =
+            pCamPlaceable->m_matrix->at = vecUp;
+            pCamPlaceable->m_matrix->pos = g_CurrentCamPos;
+            pCamPlaceable->m_matrix->UpdateRW();
+        }
+        GameSA::SetRwCamPosition();
+        GameSA::CalculateDerivedValues(false, true);
+        GameSA::SetCameraOrientation(g_CurrentYawRad);
+    }
+
+    static DWORD WINAPI CameraUpdateLoop(LPVOID /*lpParam*/) {
+        Sleep(2500);
+        Logger::Init(g_hThisModule);
+        Logger::Info("Loop de atualizacao de camera estavel iniciado.");
+
+        while (true) {
+            if (!GameSA::IsUserPaused() && !GameSA::IsCodePaused() && !GameSA::IsCutsceneRunning()) {
+                ProcessIsometricCamera();
+            }
+            Sleep(10);
+        }
+        return 0;
+    }
+
+} // namespace IsometricCamMod
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        IsometricCamMod::g_hThisModule = hModule;
+        CreateThread(nullptr, 0, IsometricCamMod::CameraUpdateLoop, nullptr, 0, nullptr);
+    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        IsometricCamMod::Logger::Shutdown();
+    }
+    return TRUE;
+}
